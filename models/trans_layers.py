@@ -73,31 +73,53 @@ class PosTransLayer(MessagePassing):
                 edge_index: Adj,
                 edge_attr: OptTensor = None
                 ) -> Tuple[Tensor, Tensor]:
-        """"""
-
+        """Explicit message passing implementation without propagate kwargs."""
         H, C = self.heads, self.out_channels
+        N = x.size(0)
 
-        x_feat = torch.cat([x, pos], -1)
-        query = self.lin_query(x_feat).view(-1, H, C)
-        key = self.lin_key(x_feat).view(-1, H, C)
-        value = self.lin_value(x_feat).view(-1, H, C)
+        # q/k/v
+        x_feat = torch.cat([x, pos], dim=-1)                      # [N, x_ch+pos_ch]
+        query = self.lin_query(x_feat).view(N, H, C)              # [N, H, C]
+        key   = self.lin_key(x_feat).view(N, H, C)                # [N, H, C]
+        value = self.lin_value(x_feat).view(N, H, C)              # [N, H, C]
 
-        # propagate_type: (x: PairTensor, edge_attr: OptTensor)
-        out_x, out_pos = self.propagate(edge_index, query=query, key=key, value=value, pos=pos, edge_attr=edge_attr,
-                                        size=None)
+        # edges
+        if edge_attr is None:
+            raise ValueError("edge_attr is required")
+        src, dst = edge_index[0], edge_index[1]                   # j -> i
+        q_i = query[dst]                                          # [E, H, C]
+        k_j = key[src]                                            # [E, H, C]
+        v_j = value[src]                                          # [E, H, C]
+        pos_j = pos[src]                                          # [E, pos_ch]
 
-        out_x = out_x.view(-1, self.heads * self.out_channels)
+        e0 = self.lin_edge0(edge_attr).view(-1, H, C)             # [E, H, C]
+        e1 = self.lin_edge1(edge_attr).view(-1, H, C)             # [E, H, C]
 
-        # skip connection for x
-        x_r = self.lin_skip(x)
+        # attention
+        alpha = (q_i * k_j * e0).sum(dim=-1) / math.sqrt(C)       # [E, H]
+        if self.attn_clamp:
+            alpha = alpha.clamp(min=-5., max=5.)
+        alpha = softmax(alpha, dst, num_nodes=N)                  # [E, H]
+        alpha = F.dropout(alpha, p=self.dropout, training=self.training)
+
+        # messages
+        msg = v_j * e1 * alpha.unsqueeze(-1)                      # [E, H, C]
+
+        # aggregate to nodes (x)
+        out_x = scatter(msg, dst, dim=0, dim_size=N, reduce=self.aggr)  # [N, H, C]
+        out_x = out_x.view(N, H * C)                              # [N, H*C]
+
+        # skip + norm + FFN
+        x_r = self.lin_skip(x)                                    # [N, H*C]
         out_x = (out_x + x_r) / math.sqrt(2)
         out_x = self.norm1(out_x)
-
-        # FFN
         out_x = (out_x + self.FFN(out_x)) / math.sqrt(2)
         out_x = self.norm2(out_x)
 
-        # skip connection for pos
+        # position update: project msg -> pos dim, then use pos_j gating, aggregate by mean
+        pos_gate = self.lin_pos(msg.reshape(-1, H * C)).reshape(-1, self.pos_channels)  # [E, pos_ch]
+        pos_msg = pos_j * pos_gate                                                      # [E, pos_ch]
+        out_pos = scatter(pos_msg, dst, dim=0, dim_size=N, reduce="mean")               # [N, pos_ch]
         out_pos = pos + torch.tanh(pos + out_pos)
 
         return out_x, out_pos
