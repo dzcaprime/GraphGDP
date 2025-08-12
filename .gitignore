@@ -2,3 +2,9 @@
 *.iml
 *.xml
 *.sh
+NRI/
+.github/
+__pycache__/
+*.pyc
+*.pyo
+work/
