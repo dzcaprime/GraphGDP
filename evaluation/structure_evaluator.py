@@ -68,8 +68,8 @@ class Descriptor():
     def pad_histogram(self, x, y):
         # convert histogram values x and y to float, and pad them for equal length
         support_size = max(len(x), len(y))
-        x = x.astype(np.float)
-        y = y.astype(np.float)
+        x = x.astype(float)
+        y = y.astype(float)
         if len(x) < len(y):
             x = np.hstack((x, [0.] * (support_size - len(x))))
         elif len(y) < len(x):
@@ -81,7 +81,7 @@ class Descriptor():
     #     support_size = max(len(x), len(y))
     #     x, y = self.pad_histogram(x, y)
     #
-    #     d_mat = toeplitz(range(support_size)).astype(np.float)
+    #     d_mat = toeplitz(range(support_size)).astype(float)
     #     distance_mat = d_mat / distance_scaling
     #
     #     dist = pyemd.emd(x, y, distance_mat)

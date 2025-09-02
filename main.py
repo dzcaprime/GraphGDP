@@ -5,6 +5,8 @@ from absl import app, flags
 from ml_collections.config_flags import config_flags
 import logging
 import os
+import warnings
+warnings.filterwarnings("ignore", category=FutureWarning, module="dgl.backend.pytorch.sparse")
 
 FLAGS = flags.FLAGS
 
