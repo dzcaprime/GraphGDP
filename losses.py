@@ -9,26 +9,29 @@ from sde_lib import VPSDE
 
 def get_optimizer(config, params):
     """Return a flax optimizer object based on `config`."""
-    if config.optim.optimizer == 'Adam':
-        optimizer = optim.Adam(params, lr=config.optim.lr, betas=(config.optim.beta1, 0.999), eps=config.optim.eps,
-                               weight_decay=config.optim.weight_decay)
-    else:
-        raise NotImplementedError(
-            f'Optimizer {config.optim.optimizer} not supported yet!'
+    if config.optim.optimizer == "Adam":
+        optimizer = optim.Adam(
+            params,
+            lr=config.optim.lr,
+            betas=(config.optim.beta1, 0.999),
+            eps=config.optim.eps,
+            weight_decay=config.optim.weight_decay,
         )
+    else:
+        raise NotImplementedError(f"Optimizer {config.optim.optimizer} not supported yet!")
     return optimizer
 
 
 def optimization_manager(config):
     """Return an optimize_fn based on `config`."""
 
-    def optimize_fn(optimizer, params, step, lr=config.optim.lr,
-                    warmup=config.optim.warmup,
-                    grad_clip=config.optim.grad_clip):
+    def optimize_fn(
+        optimizer, params, step, lr=config.optim.lr, warmup=config.optim.warmup, grad_clip=config.optim.grad_clip
+    ):
         """Optimize with warmup and gradient clipping (disabled if negative)."""
         if warmup > 0:
             for g in optimizer.param_groups:
-                g['lr'] = lr * np.minimum(step / warmup, 1.0)
+                g["lr"] = lr * np.minimum(step / warmup, 1.0)
         if grad_clip >= 0:
             torch.nn.utils.clip_grad_norm_(params, max_norm=grad_clip)
         optimizer.step()
@@ -126,11 +129,18 @@ def get_step_fn(sde, train, optimize_fn=None, reduce_mean=False, continuous=True
 
     if continuous:
         if isinstance(sde, tuple):
-            loss_fn = get_multi_sde_loss_fn(sde[0], sde[1], train, reduce_mean=reduce_mean, continuous=True,
-                                            likelihood_weighting=likelihood_weighting)
+            loss_fn = get_multi_sde_loss_fn(
+                sde[0],
+                sde[1],
+                train,
+                reduce_mean=reduce_mean,
+                continuous=True,
+                likelihood_weighting=likelihood_weighting,
+            )
         else:
-            loss_fn = get_sde_loss_fn(sde, train, reduce_mean=reduce_mean,
-                                      continuous=True, likelihood_weighting=likelihood_weighting)
+            loss_fn = get_sde_loss_fn(
+                sde, train, reduce_mean=reduce_mean, continuous=True, likelihood_weighting=likelihood_weighting
+            )
     else:
         assert not likelihood_weighting, "Likelihood weighting is not supported for original SMLD/DDPM training."
         if isinstance(sde, VESDE):
@@ -156,18 +166,18 @@ def get_step_fn(sde, train, optimize_fn=None, reduce_mean=False, continuous=True
         Returns:
             loss: The average loss value of this state.
         """
-        model = state['model']
+        model = state["model"]
         if train:
-            optimizer = state['optimizer']
+            optimizer = state["optimizer"]
             optimizer.zero_grad()
             loss = loss_fn(model, batch)
             loss.backward()
-            optimize_fn(optimizer, model.parameters(), step=state['step'])
-            state['step'] += 1
-            state['ema'].update(model.parameters())
+            optimize_fn(optimizer, model.parameters(), step=state["step"])
+            state["step"] += 1
+            state["ema"].update(model.parameters())
         else:
             with torch.no_grad():
-                ema = state['ema']
+                ema = state["ema"]
                 ema.store(model.parameters())
                 ema.copy_to(model.parameters())
                 loss = loss_fn(model, batch)
