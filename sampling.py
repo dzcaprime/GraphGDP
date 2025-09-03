@@ -26,7 +26,7 @@ def register_predictor(cls=None, *, name=None):
         else:
             local_name = name
         if local_name in _PREDICTORS:
-            raise ValueError(f'Already registered predictor with name: {local_name}')
+            raise ValueError(f"Already registered predictor with name: {local_name}")
         _PREDICTORS[local_name] = cls
         return cls
 
@@ -45,7 +45,7 @@ def register_corrector(cls=None, *, name=None):
         else:
             local_name = name
         if local_name in _CORRECTORS:
-            raise ValueError(f'Already registered corrector with name: {local_name}')
+            raise ValueError(f"Already registered corrector with name: {local_name}")
         _CORRECTORS[local_name] = cls
         return cls
 
@@ -80,42 +80,67 @@ def get_sampling_fn(config, sde, shape, inverse_scaler, eps):
 
     sampler_name = config.sampling.method
     # Probability flow ODE sampling with black-box ODE solvers
-    if sampler_name.lower() == 'ode':
-        sampling_fn = get_ode_sampler(sde=sde,
-                                      shape=shape,
-                                      inverse_scaler=inverse_scaler,
-                                      denoise=config.sampling.noise_removal,
-                                      eps=eps,
-                                      rtol=config.sampling.rtol,
-                                      atol=config.sampling.atol,
-                                      device=config.device)
-    elif sampler_name.lower() == 'diffeq':
-        sampling_fn = get_diffeq_sampler(sde=sde,
-                                         shape=shape,
-                                         inverse_scaler=inverse_scaler,
-                                         denoise=config.sampling.noise_removal,
-                                         eps=eps,
-                                         rtol=config.sampling.rtol,
-                                         atol=config.sampling.atol,
-                                         step_size=config.sampling.ode_step,
-                                         method=config.sampling.ode_method,
-                                         device=config.device)
+    if sampler_name.lower() == "ode":
+        sampling_fn = get_ode_sampler(
+            sde=sde,
+            shape=shape,
+            inverse_scaler=inverse_scaler,
+            denoise=config.sampling.noise_removal,
+            eps=eps,
+            rtol=config.sampling.rtol,
+            atol=config.sampling.atol,
+            device=config.device,
+        )
+    elif sampler_name.lower() == "diffeq":
+        sampling_fn = get_diffeq_sampler(
+            sde=sde,
+            shape=shape,
+            inverse_scaler=inverse_scaler,
+            denoise=config.sampling.noise_removal,
+            eps=eps,
+            rtol=config.sampling.rtol,
+            atol=config.sampling.atol,
+            step_size=config.sampling.ode_step,
+            method=config.sampling.ode_method,
+            device=config.device,
+        )
     # Predictor-Corrector sampling. Predictor-only and Corrector-only samplers are special cases.
-    elif sampler_name.lower() == 'pc':
+    elif sampler_name.lower() == "pc":
         predictor = get_predictor(config.sampling.predictor.lower())
         corrector = get_corrector(config.sampling.corrector.lower())
-        sampling_fn = get_pc_sampler(sde=sde,
-                                     shape=shape,
-                                     predictor=predictor,
-                                     corrector=corrector,
-                                     inverse_scaler=inverse_scaler,
-                                     snr=config.sampling.snr,
-                                     n_steps=config.sampling.n_steps_each,
-                                     probability_flow=config.sampling.probability_flow,
-                                     continuous=config.training.continuous,
-                                     denoise=config.sampling.noise_removal,
-                                     eps=eps,
-                                     device=config.device)
+        sampling_fn = get_pc_sampler(
+            sde=sde,
+            shape=shape,
+            predictor=predictor,
+            corrector=corrector,
+            inverse_scaler=inverse_scaler,
+            snr=config.sampling.snr,
+            n_steps=config.sampling.n_steps_each,
+            probability_flow=config.sampling.probability_flow,
+            continuous=config.training.continuous,
+            denoise=config.sampling.noise_removal,
+            eps=eps,
+            device=config.device,
+        )
+    elif sampler_name.lower() == "guided_pc":
+        predictor = get_predictor(config.sampling.predictor.lower())
+        corrector = get_corrector(config.sampling.corrector.lower())
+        sampling_fn = get_guided_pc_sampler(
+            sde=sde,
+            shape=shape,
+            predictor=predictor,
+            corrector=corrector,
+            inverse_scaler=inverse_scaler,
+            snr=config.sampling.snr,
+            n_steps=config.sampling.n_steps_each,
+            probability_flow=config.sampling.probability_flow,
+            continuous=config.training.continuous,
+            denoise=config.sampling.noise_removal,
+            eps=eps,
+            device=config.device,
+            decoder=config.decoder,
+            guidance_weight=config.sampling.guidance_weight,
+        )
     else:
         raise ValueError(f"Sampler name {sampler_name} unknown.")
 
@@ -175,13 +200,13 @@ class Corrector(abc.ABC):
         pass
 
 
-@register_predictor(name='euler_maruyama')
+@register_predictor(name="euler_maruyama")
 class EulerMaruyamaPredictor(Predictor):
     def __init__(self, sde, score_fn, probability_flow=False):
         super().__init__(sde, score_fn, probability_flow)
 
     def update_fn(self, x, t, *args, **kwargs):
-        dt = -1. / self.rsde.N
+        dt = -1.0 / self.rsde.N
         z = torch.randn_like(x)
         z = torch.tril(z, -1)
         z = z + z.transpose(-1, -2)
@@ -193,7 +218,7 @@ class EulerMaruyamaPredictor(Predictor):
         return x, x_mean
 
 
-@register_predictor(name='reverse_diffusion')
+@register_predictor(name="reverse_diffusion")
 class ReverseDiffusionPredictor(Predictor):
     def __init__(self, sde, score_fn, probability_flow=False):
         super().__init__(sde, score_fn, probability_flow)
@@ -211,7 +236,7 @@ class ReverseDiffusionPredictor(Predictor):
         return x, x_mean
 
 
-@register_predictor(name='none')
+@register_predictor(name="none")
 class NonePredictor(Predictor):
     """An empty predictor that does nothing."""
 
@@ -222,7 +247,7 @@ class NonePredictor(Predictor):
         return x, x
 
 
-@register_corrector(name='langevin')
+@register_corrector(name="langevin")
 class LangevinCorrector(Corrector):
     def __init__(self, sde, score_fn, snr, n_steps):
         super().__init__(sde, score_fn, snr, n_steps)
@@ -247,7 +272,7 @@ class LangevinCorrector(Corrector):
             noise = torch.tril(noise, -1)
             noise = noise + noise.transpose(-1, -2)
 
-            mask = kwargs['mask']
+            mask = kwargs["mask"]
 
             # mask invalid elements and calculate norm
             mask_tmp = mask.reshape(mask.shape[0], -1)
@@ -262,7 +287,7 @@ class LangevinCorrector(Corrector):
         return x, x_mean
 
 
-@register_corrector(name='none')
+@register_corrector(name="none")
 class NoneCorrector(Corrector):
     """An empty corrector that does nothing."""
 
@@ -298,9 +323,20 @@ def shared_corrector_update_fn(x, t, sde, model, corrector, continuous, snr, n_s
     return corrector_obj.update_fn(x, t, *args, **kwargs)
 
 
-def get_pc_sampler(sde, shape, predictor, corrector, inverse_scaler, snr,
-                   n_steps=1, probability_flow=False, continuous=False,
-                   denoise=True, eps=1e-3, device='cuda'):
+def get_pc_sampler(
+    sde,
+    shape,
+    predictor,
+    corrector,
+    inverse_scaler,
+    snr,
+    n_steps=1,
+    probability_flow=False,
+    continuous=False,
+    denoise=True,
+    eps=1e-3,
+    device="cuda",
+):
     """Create a Predictor-Corrector (PC) sampler.
 
     Args:
@@ -321,17 +357,16 @@ def get_pc_sampler(sde, shape, predictor, corrector, inverse_scaler, snr,
         A sampling function that returns samples and the number of function evaluations during sampling.
     """
     # Create predictor & corrector update functions
-    predictor_update_fn = functools.partial(shared_predictor_update_fn,
-                                            sde=sde,
-                                            predictor=predictor,
-                                            probability_flow=probability_flow,
-                                            continuous=continuous)
-    corrector_update_fn = functools.partial(shared_corrector_update_fn,
-                                            sde=sde,
-                                            corrector=corrector,
-                                            continuous=continuous,
-                                            snr=snr,
-                                            n_steps=n_steps)
+    predictor_update_fn = functools.partial(
+        shared_predictor_update_fn,
+        sde=sde,
+        predictor=predictor,
+        probability_flow=probability_flow,
+        continuous=continuous,
+    )
+    corrector_update_fn = functools.partial(
+        shared_corrector_update_fn, sde=sde, corrector=corrector, continuous=continuous, snr=snr, n_steps=n_steps
+    )
 
     def pc_sampler(model, n_nodes_pmf):
         """The PC sampler function.
@@ -352,7 +387,7 @@ def get_pc_sampler(sde, shape, predictor, corrector, inverse_scaler, snr,
             n_nodes = torch.multinomial(n_nodes_pmf, shape[0], replacement=True)
             mask = torch.zeros((shape[0], shape[-1]), device=device)
             for i in range(shape[0]):
-                mask[i][:n_nodes[i]] = 1.
+                mask[i][: n_nodes[i]] = 1.0
             mask = (mask[:, None, :] * mask[:, :, None]).unsqueeze(1)
             mask = torch.tril(mask, -1)
             mask = mask + mask.transpose(-1, -2)
@@ -372,8 +407,9 @@ def get_pc_sampler(sde, shape, predictor, corrector, inverse_scaler, snr,
     return pc_sampler
 
 
-def get_ode_sampler(sde, shape, inverse_scaler, denoise=False,
-                    rtol=1e-5, atol=1e-5, method='RK45', eps=1e-3, device='cuda'):
+def get_ode_sampler(
+    sde, shape, inverse_scaler, denoise=False, rtol=1e-5, atol=1e-5, method="RK45", eps=1e-3, device="cuda"
+):
     """Probability flow ODE sampler with the black-box ODE solver.
 
     Args:
@@ -428,7 +464,7 @@ def get_ode_sampler(sde, shape, inverse_scaler, denoise=False,
             n_nodes = torch.multinomial(n_nodes_pmf, shape[0], replacement=True)
             mask = torch.zeros((shape[0], shape[-1]), device=device)
             for i in range(shape[0]):
-                mask[i][:n_nodes[i]] = 1.
+                mask[i][: n_nodes[i]] = 1.0
             mask = (mask[:, None, :] * mask[:, :, None]).unsqueeze(1)
 
             def ode_func(t, x):
@@ -438,8 +474,9 @@ def get_ode_sampler(sde, shape, inverse_scaler, denoise=False,
                 return to_flattened_numpy(drift)
 
             # Black-box ODE solver for the probability flow ODE
-            solution = integrate.solve_ivp(ode_func, (sde.T, eps), to_flattened_numpy(x),
-                                           rtol=rtol, atol=atol, method=method)
+            solution = integrate.solve_ivp(
+                ode_func, (sde.T, eps), to_flattened_numpy(x), rtol=rtol, atol=atol, method=method
+            )
             nfe = solution.nfev
             x = torch.tensor(solution.y[:, -1]).reshape(shape).to(device).type(torch.float32)
 
@@ -453,8 +490,18 @@ def get_ode_sampler(sde, shape, inverse_scaler, denoise=False,
     return ode_sampler
 
 
-def get_diffeq_sampler(sde, shape, inverse_scaler, denoise=False,
-                       rtol=1e-5, atol=1e-5, step_size=0.01, method='dopri5', eps=1e-3, device='cuda'):
+def get_diffeq_sampler(
+    sde,
+    shape,
+    inverse_scaler,
+    denoise=False,
+    rtol=1e-5,
+    atol=1e-5,
+    step_size=0.01,
+    method="dopri5",
+    eps=1e-3,
+    device="cuda",
+):
     """
     Args:
         sde: An `sde_lib.SDE` object that represents the forward SDE.
@@ -508,7 +555,7 @@ def get_diffeq_sampler(sde, shape, inverse_scaler, denoise=False,
             n_nodes = torch.multinomial(n_nodes_pmf, shape[0], replacement=True)
             mask = torch.zeros((shape[0], shape[-1]), device=device)
             for i in range(shape[0]):
-                mask[i][:n_nodes[i]] = 1.
+                mask[i][: n_nodes[i]] = 1.0
             mask = (mask[:, None, :] * mask[:, :, None]).unsqueeze(1)
 
             class ODEfunc(torch.nn.Module):
@@ -525,14 +572,26 @@ def get_diffeq_sampler(sde, shape, inverse_scaler, denoise=False,
 
             # Black-box ODE solver for the probability flow ODE
             ode_func = ODEfunc()
-            if method in ['dopri5', 'bosh3', 'fehlberg2']:
-                solution = odeint(ode_func, x.reshape((-1,)), torch.tensor([sde.T, eps], device=x.device),
-                                  rtol=rtol, atol=atol, method=method,
-                                  options={'step_t': torch.tensor([1e-3], device=x.device)})
-            elif method in ['euler', 'midpoint', 'rk4', 'explicit_adams', 'implicit_adams']:
-                solution = odeint(ode_func, x.reshape((-1,)), torch.tensor([sde.T, eps], device=x.device),
-                                  rtol=rtol, atol=atol, method=method,
-                                  options={'step_size': step_size})
+            if method in ["dopri5", "bosh3", "fehlberg2"]:
+                solution = odeint(
+                    ode_func,
+                    x.reshape((-1,)),
+                    torch.tensor([sde.T, eps], device=x.device),
+                    rtol=rtol,
+                    atol=atol,
+                    method=method,
+                    options={"step_t": torch.tensor([1e-3], device=x.device)},
+                )
+            elif method in ["euler", "midpoint", "rk4", "explicit_adams", "implicit_adams"]:
+                solution = odeint(
+                    ode_func,
+                    x.reshape((-1,)),
+                    torch.tensor([sde.T, eps], device=x.device),
+                    rtol=rtol,
+                    atol=atol,
+                    method=method,
+                    options={"step_size": step_size},
+                )
 
             x = solution[-1, :].reshape(shape)
 
@@ -556,7 +615,7 @@ def likelihood_guided_step(
     mask: torch.Tensor,
     guidance_weight: float = 1.0,
     eps_stabilize: float = 1e-8,
-    continuous: bool = True
+    continuous: bool = True,
 ):
     """
     单步似然引导采样（改进版，修正 Tweedie 与映射因子）。
@@ -564,21 +623,23 @@ def likelihood_guided_step(
     # 1) 原始 score（冻结模型梯度）
     score_fn = mutils.get_score_fn(sde, model, train=False, continuous=continuous)
     with torch.no_grad():
-        original_score = score_fn(A_t, t, mask=mask, ts=X_obs)  # [B, C, N, N]
+        original_score = score_fn(A_t, t, mask=mask)  # [B, C, N, N]
 
     # 2) Tweedie 去噪：A0_hat = (A_t + std^2 * score) / mean
-    if hasattr(sde, 'marginal_prob'):
+    if hasattr(sde, "marginal_prob"):
         mean, std = sde.marginal_prob(torch.zeros_like(A_t), t)  # [B] 或 [B,1,1,1]
-        if mean.dim() == 1: mean = mean.view(-1, 1, 1, 1)
-        if std.dim() == 1:  std  = std.view(-1, 1, 1, 1)
-        A_0_hat = (A_t + (std ** 2) * original_score) / (mean + eps_stabilize)
+        if mean.dim() == 1:
+            mean = mean.view(-1, 1, 1, 1)
+        if std.dim() == 1:
+            std = std.view(-1, 1, 1, 1)
+        A_0_hat = (A_t + (std**2) * original_score) / (mean + eps_stabilize)
         c = mean  # ∂A0/∂At = 1/mean
     else:
         A_0_hat = A_t
         c = torch.ones_like(A_t[:, :1, :1, :1])
 
     # 3) 投影并构造可导副本（只对 A0_clean 求导，不回传投影）
-    A_0_clean = (A_0_hat.squeeze(1) * mask.squeeze(1))  # [B, N, N]
+    A_0_clean = A_0_hat.squeeze(1) * mask.squeeze(1)  # [B, N, N]
     decoder.eval()
     with torch.no_grad():
         A_0_clean = decoder.project_adjacency(A_0_clean)  # 建议保持对称与零对角
@@ -590,10 +651,7 @@ def likelihood_guided_step(
         if loglik is None or (hasattr(loglik, "requires_grad") and not loglik.requires_grad):
             grad_A0 = torch.zeros_like(A_0_var)
         else:
-            grad_A0 = torch.autograd.grad(
-                outputs=loglik, inputs=A_0_var,
-                retain_graph=False, create_graph=False
-            )[0]
+            grad_A0 = torch.autograd.grad(outputs=loglik, inputs=A_0_var, retain_graph=False, create_graph=False)[0]
     except Exception as e:
         print(f"Gradient computation failed: {e}")
         grad_A0 = torch.zeros_like(A_0_var)
@@ -617,24 +675,37 @@ def likelihood_guided_step(
 
     return guided_score
 
-def get_guided_pc_sampler(sde, shape, predictor, corrector, inverse_scaler, snr,
-                         n_steps=1, probability_flow=False, continuous=False,
-                         denoise=True, eps=1e-3, device='cuda', decoder=None, guidance_weight=1.0):
+
+def get_guided_pc_sampler(
+    sde,
+    shape,
+    predictor,
+    corrector,
+    inverse_scaler,
+    snr,
+    n_steps=1,
+    probability_flow=False,
+    continuous=False,
+    denoise=True,
+    eps=1e-3,
+    device="cuda",
+    decoder=None,
+    guidance_weight=1.0,
+):
     """Create a guided PC sampler with improved error handling."""
-    
+
     # Create predictor & corrector update functions
-    predictor_update_fn = functools.partial(shared_predictor_update_fn,
-                                            sde=sde,
-                                            predictor=predictor,
-                                            probability_flow=probability_flow,
-                                            continuous=continuous)
-    corrector_update_fn = functools.partial(shared_corrector_update_fn,
-                                            sde=sde,
-                                            corrector=corrector,
-                                            continuous=continuous,
-                                            snr=snr,
-                                            n_steps=n_steps)
-    
+    predictor_update_fn = functools.partial(
+        shared_predictor_update_fn,
+        sde=sde,
+        predictor=predictor,
+        probability_flow=probability_flow,
+        continuous=continuous,
+    )
+    corrector_update_fn = functools.partial(
+        shared_corrector_update_fn, sde=sde, corrector=corrector, continuous=continuous, snr=snr, n_steps=n_steps
+    )
+
     def guided_pc_sampler(model, n_nodes_pmf, ts=None):
         with torch.no_grad():
             x = sde.prior_sampling(shape).to(device)
@@ -657,13 +728,21 @@ def get_guided_pc_sampler(sde, shape, predictor, corrector, inverse_scaler, snr,
 
                 if decoder is not None and ts is not None:
                     guided_score = likelihood_guided_step(
-                        A_t=x, t=vec_t, sde=sde, model=model, decoder=decoder,
-                        X_obs=ts, mask=edge_mask, guidance_weight=guidance_weight,
-                        continuous=continuous
+                        A_t=x,
+                        t=vec_t,
+                        sde=sde,
+                        model=model,
+                        decoder=decoder,
+                        X_obs=ts,
+                        mask=edge_mask,
+                        guidance_weight=guidance_weight,
+                        continuous=continuous,
                     )
+
                     # 用 guided score 构造一次性 predictor
                     def temp_score_fn(x_in, t_in, **kwargs):
                         return guided_score
+
                     if predictor is None:
                         x_mean = x
                     else:
@@ -685,5 +764,5 @@ def get_guided_pc_sampler(sde, shape, predictor, corrector, inverse_scaler, snr,
                 x = x * edge_mask
 
             return inverse_scaler(x), sde.N * (n_steps + 1), n_nodes
-    
+
     return guided_pc_sampler

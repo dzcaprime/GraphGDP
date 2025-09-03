@@ -9,7 +9,7 @@ get_act = layers.get_act
 conv1x1 = layers.conv1x1
 
 
-@utils.register_model(name='PGSN')
+@utils.register_model(name="PGSN")
 class PGSN(nn.Module):
     """Position enhanced graph score network."""
 
@@ -29,10 +29,10 @@ class PGSN(nn.Module):
 
         modules = []
         # timestep/noise_level embedding; only for continuous training
-        if embedding_type == 'positional':
+        if embedding_type == "positional":
             embed_dim = nf
         else:
-            raise ValueError(f'embedding type {embedding_type} unknown.')
+            raise ValueError(f"embedding type {embedding_type} unknown.")
 
         # timestep embedding layers
         modules.append(nn.Linear(embed_dim, nf * 4))
@@ -50,9 +50,7 @@ class PGSN(nn.Module):
 
         # degree onehot
         self.degree_max = self.config.data.max_node // 2
-        self.degree_onehot = functools.partial(
-            nn.functional.one_hot,
-            num_classes=self.degree_max + 1)
+        self.degree_onehot = functools.partial(nn.functional.one_hot, num_classes=self.degree_max + 1)
 
         # project edge features
         modules.append(conv1x1(channels, nf // 2))
@@ -65,10 +63,22 @@ class PGSN(nn.Module):
         modules.append(nn.Linear(rw_depth, self.pos_ch))
 
         # GNN
-        modules.append(gnns.pos_gnn(act, self.x_ch, self.pos_ch, nf, config.data.max_node,
-                                    config.model.graph_layer, num_gnn_layers,
-                                    heads=config.model.heads, edge_dim=nf//2, temb_dim=nf * 4,
-                                    dropout=dropout, attn_clamp=config.model.attn_clamp))
+        modules.append(
+            gnns.pos_gnn(
+                act,
+                self.x_ch,
+                self.pos_ch,
+                nf,
+                config.data.max_node,
+                config.model.graph_layer,
+                num_gnn_layers,
+                heads=config.model.heads,
+                edge_dim=nf // 2,
+                temb_dim=nf * 4,
+                dropout=dropout,
+                attn_clamp=config.model.attn_clamp,
+            )
+        )
 
         # output
         modules.append(conv1x1(nf // 2, nf // 2))
@@ -77,7 +87,7 @@ class PGSN(nn.Module):
         self.all_modules = nn.ModuleList(modules)
 
     def forward(self, x, time_cond, *args, **kwargs):
-        mask = kwargs['mask']
+        mask = kwargs["mask"]
         modules = self.all_modules
         m_idx = 0
 
@@ -104,20 +114,20 @@ class PGSN(nn.Module):
 
         if not self.config.data.centered:
             # rescale the input data to [-1, 1]
-            x = x * 2. - 1.
+            x = x * 2.0 - 1.0
 
         with torch.no_grad():
             # continuous-valued graph adjacency matrices
-            cont_adj = ((x + 1.) / 2.).clone()
+            cont_adj = ((x + 1.0) / 2.0).clone()
             cont_adj = (cont_adj * mask).squeeze(1)  # [B, N, N]
-            cont_adj = cont_adj.clamp(min=0., max=1.)
-            if self.edge_th > 0.:
-                cont_adj[cont_adj < self.edge_th] = 0.
+            cont_adj = cont_adj.clamp(min=0.0, max=1.0)
+            if self.edge_th > 0.0:
+                cont_adj[cont_adj < self.edge_th] = 0.0
 
             # discretized graph adjacency matrices
             adj = x.squeeze(1).clone()  # [B, N, N]
-            adj[adj >= 0.] = 1.
-            adj[adj < 0.] = 0.
+            adj[adj >= 0.0] = 1.0
+            adj[adj < 0.0] = 0.0
             adj = adj * mask.squeeze(1)
 
         # extract RWSE and Shortest-Path Distance
@@ -157,7 +167,7 @@ class PGSN(nn.Module):
         m_idx += 1
 
         # make edge estimation symmetric
-        h = (h + h.transpose(2, 3)) / 2. * mask
+        h = (h + h.transpose(2, 3)) / 2.0 * mask
 
         assert m_idx == len(modules)
 
