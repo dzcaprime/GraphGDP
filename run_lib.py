@@ -12,47 +12,22 @@ import time
 from absl import flags
 from torch.utils import tensorboard
 from torch_geometric.loader import DataLoader
-import pickle
 import networkx as nx  # 兼容 NetworkX 3.x
 
 if not hasattr(nx, "from_numpy_matrix"):
     nx.from_numpy_matrix = nx.from_numpy_array
 
-from models import pgsn
 import losses
 import sampling
 from models import utils as mutils
 from models.temporal_decoder import TemporalDecoder  # 新增：导入时序解码器
 from models.ema import ExponentialMovingAverage
 import datasets
-from evaluation import get_stats_eval, get_nn_eval
 from run_lib_backup import sde_train, sde_evaluate
 import sde_lib
-import visualize
 from sklearn.metrics import roc_auc_score
 from utils import *
-from torch_geometric.data import Data  # 增加：用于构造评估用 Data 对象
 from train_dec import train_temporal_decoder  # 新增：导入解码器训练函数
-
-
-def edge_accuracy(preds, target, threshold=0.5):
-    """Compute edge accuracy for predicted vs target adjacency matrices.
-
-    Args:
-        preds: [B, 1, N, N] or [B, N, N] predicted adjacency (continuous).
-        target: [B, 1, N, N] or [B, N, N] target adjacency (binary).
-        threshold: Threshold for binarizing predictions.
-
-    Returns:
-        Accuracy as a scalar tensor.
-    """
-    preds = preds.squeeze(1) if preds.dim() == 4 else preds  # [B, N, N]
-    target = target.squeeze(1) if target.dim() == 4 else target  # [B, N, N]
-    preds_binary = (preds > threshold).float()
-    correct = preds_binary.eq(target).float().sum()
-    total = target.numel()
-    return correct / total
-
 
 def _compute_batch_auroc(preds: torch.Tensor, target: torch.Tensor, mask: torch.Tensor) -> float:
     """
