@@ -88,6 +88,11 @@ class PGSN(nn.Module):
 
     def forward(self, x, time_cond, *args, **kwargs):
         mask = kwargs["mask"]
+        # 规范化 mask：去 NaN/Inf 并夹紧到 [0,1]，避免传播异常值
+        mask = torch.nan_to_num(
+            mask.to(x.dtype), nan=0.0, posinf=1.0, neginf=0.0
+        ).clamp(0.0, 1.0)
+
         modules = self.all_modules
         m_idx = 0
 
@@ -105,7 +110,14 @@ class PGSN(nn.Module):
             with torch.no_grad():
                 node_mask = utils.mask_adj2node(mask.squeeze(1))  # [B, N]
                 num_node = torch.sum(node_mask, dim=-1)  # [B]
-                num_node = self.size_onehot(num_node.to(torch.long)).to(torch.float)
+                # 安全化：去 NaN/Inf -> 夹到 [0, max_node] -> 转 long
+                num_node = torch.nan_to_num(
+                    num_node, nan=0.0, posinf=0.0, neginf=0.0
+                )
+                max_node = self.config.data.max_node
+                num_node = num_node.clamp(0, max_node).to(torch.long)
+                num_node = self.size_onehot(num_node).to(torch.float)
+
             num_node_emb = modules[m_idx](num_node)
             m_idx += 1
             num_node_emb = modules[m_idx](self.act(num_node_emb))
@@ -115,6 +127,8 @@ class PGSN(nn.Module):
         if not self.config.data.centered:
             # rescale the input data to [-1, 1]
             x = x * 2.0 - 1.0
+        # 数值清理：去除 NaN/Inf，并夹紧到 [-1,1]，防止后续投影/卷积被污染
+        x = torch.nan_to_num(x, nan=0.0, posinf=1.0, neginf=-1.0).clamp_(-1.0, 1.0)
 
         with torch.no_grad():
             # continuous-valued graph adjacency matrices
@@ -123,6 +137,11 @@ class PGSN(nn.Module):
             cont_adj = cont_adj.clamp(min=0.0, max=1.0)
             if self.edge_th > 0.0:
                 cont_adj[cont_adj < self.edge_th] = 0.0
+
+            # 进一步数值稳定：去 NaN/Inf 并夹紧
+            cont_adj = torch.nan_to_num(
+                cont_adj, nan=0.0, posinf=1.0, neginf=0.0
+            ).clamp_(0.0, 1.0)
 
             # discretized graph adjacency matrices
             adj = x.squeeze(1).clone()  # [B, N, N]
@@ -141,8 +160,12 @@ class PGSN(nn.Module):
 
         # Use Degree as node feature
         x_degree = torch.sum(cont_adj, dim=-1)  # [B, N]
-        x_degree = x_degree.clamp(max=float(self.degree_max))
-        x_degree = self.degree_onehot(x_degree.to(torch.long)).to(torch.float)  # [B, N, max_node]
+        # 安全化度数：去 NaN/Inf -> 夹到 [0, degree_max] -> 转 long 并二次 clamp
+        x_degree = torch.nan_to_num(
+            x_degree, nan=0.0, posinf=float(self.degree_max), neginf=0.0
+        ).clamp(0.0, float(self.degree_max))
+        x_degree_long = x_degree.to(torch.long).clamp(0, self.degree_max)
+        x_degree = self.degree_onehot(x_degree_long).to(torch.float)  # [B,N,K]
         x_degree = modules[m_idx](x_degree)  # projection layer [B, N, nf]
         m_idx += 1
 
@@ -153,11 +176,26 @@ class PGSN(nn.Module):
         # Dense to sparse node [BxN, -1]
         x_degree = x_degree.reshape(-1, self.x_ch)
         x_pos = x_pos.reshape(-1, self.pos_ch)
-        dense_index = cont_adj.nonzero(as_tuple=True)
-        edge_index, _ = dense_to_sparse(cont_adj)
+
+        # 从 batched 稠密邻接安全构造与 [B*N, ·] 对齐的 edge_index
+        B, N, _ = cont_adj.shape
+        dense_index = cont_adj.nonzero(as_tuple=True)  # (b,i,j)
+        idx = cont_adj.nonzero(as_tuple=False)        # [E,3]
+        if idx.numel() == 0:
+            # 哑元边，避免空图在下游 GNN 中崩溃（索引 0 始终有效）
+            device = cont_adj.device
+            edge_index = torch.zeros((2, 1), dtype=torch.long, device=device)
+        else:
+            b = idx[:, 0]; i = idx[:, 1]; j = idx[:, 2]
+            row = i + b * N
+            col = j + b * N
+            edge_index = torch.stack((row, col), dim=0)  # [2, E]
 
         # Run GNN layers
-        h_dense_edge = modules[m_idx](x_degree, x_pos, edge_index, dense_edge_ori, dense_edge_spd, dense_index, temb)
+        h_dense_edge = modules[m_idx](
+            x_degree, x_pos, edge_index,
+            dense_edge_ori, dense_edge_spd, dense_index, temb
+        )
         m_idx += 1
 
         # Output
