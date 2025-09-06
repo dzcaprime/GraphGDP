@@ -4,6 +4,7 @@ import functools
 from torch_geometric.utils import dense_to_sparse
 
 from . import utils, layers, gnns
+from .ts_encoder import TemporalEncoder  # 新增：时间序列编码器
 
 get_act = layers.get_act
 conv1x1 = layers.conv1x1
@@ -27,6 +28,31 @@ class PGSN(nn.Module):
         self.rw_depth = rw_depth = config.model.rw_depth
         self.edge_th = config.model.edge_th
 
+        # ====== 时间条件（可选）======
+        self.use_ts = config.model.ts_cond
+        if self.use_ts:
+            ts_in = config.data.ts_features
+            ts_hid = config.model.ts_hid
+            ts_dropout = config.model.ts_dropout
+            self.ts_fuse_mode = config.model.ts_fuse_mode.lower()
+            if self.ts_fuse_mode != "concat":
+                raise ValueError(f"当前仅实现 concat 融合，收到 {self.ts_fuse_mode}")
+            # TemporalEncoder 输出维度设为 ts_hid，后续线性映射回 nf
+            self.temporal_encoder = TemporalEncoder(
+                in_dim=ts_in,
+                hidden_dim=ts_hid,
+                out_dim=ts_hid,
+                dropout=ts_dropout,
+                rnn_type="gru",
+                num_layers=1,
+            )
+            self.ts_fuse = nn.Sequential(
+                nn.Dropout(ts_dropout),
+                nn.Linear(nf + ts_hid, nf),
+                nn.GELU(),
+                nn.LayerNorm(nf),
+            )
+        # ====== 其余模块 ======
         modules = []
         # timestep/noise_level embedding; only for continuous training
         if embedding_type == "positional":
@@ -166,10 +192,32 @@ class PGSN(nn.Module):
         ).clamp(0.0, float(self.degree_max))
         x_degree_long = x_degree.to(torch.long).clamp(0, self.degree_max)
         x_degree = self.degree_onehot(x_degree_long).to(torch.float)  # [B,N,K]
-        x_degree = modules[m_idx](x_degree)  # projection layer [B, N, nf]
+        x_degree = modules[m_idx](x_degree)  # [B,N,nf]
         m_idx += 1
 
-        # pos encoding
+        # ====== 时间序列条件融合（concat 模式）======
+        if self.use_ts:
+            ts_raw = kwargs.get("ts", None)
+            if ts_raw is not None:
+                # 期望 [B,T,N,D]；若为 [B,N,T,D] 则转置
+                if ts_raw.dim() == 4:
+                    if ts_raw.size(2) == x_degree.size(1) and ts_raw.size(1) != x_degree.size(1):
+                        # [B,N,T,D] -> [B,T,N,D]
+                        ts_raw = ts_raw.permute(0, 2, 1, 3).contiguous()
+                    elif ts_raw.size(1) != x_degree.size(1) and ts_raw.size(2) != x_degree.size(1):
+                        # 不匹配节点数，放弃融合（静默跳过，保持稳健）
+                        ts_raw = None
+                else:
+                    ts_raw = None
+            if ts_raw is not None:
+                ts_emb = self.temporal_encoder(ts_raw)  # [B,N,ts_hid]
+                if ts_emb.size(1) == x_degree.size(0):  # 容错：防误传形状
+                    pass
+                if ts_emb.size(1) == x_degree.size(1):
+                    x_degree = self.ts_fuse(torch.cat([x_degree, ts_emb], dim=-1))
+                # 若维度仍不匹配则安全跳过
+
+        # ====== 位置编码 ======
         x_pos = modules[m_idx](x_pos)
         m_idx += 1
 
