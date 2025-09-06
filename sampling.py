@@ -1,6 +1,7 @@
 """Various sampling methods."""
 
 import functools
+from re import X
 
 import torch
 import numpy as np
@@ -138,7 +139,6 @@ def get_sampling_fn(config, sde, shape, inverse_scaler, eps):
             denoise=config.sampling.noise_removal,
             eps=eps,
             device=config.device,
-            decoder=config.decoder,
             guidance_weight=config.sampling.guidance_weight,
         )
     else:
@@ -618,8 +618,12 @@ def likelihood_guided_step(
     continuous: bool = True,
 ):
     """
-    单步似然引导采样（改进版，修正 Tweedie 与映射因子）。
+    单步似然引导采样（在 no_grad 外围下，局部开启梯度用于 decoder）。
     """
+    # check data shape
+    if X_obs.shape[2] != A_t.size(-1) and X_obs.shape[1] != A_t.size(-1):
+        X_obs = X_obs.permute(0,2,1,3).contiguous() # [B, N, T, C]-->[B, T, N, C]
+        
     # 1) 原始 score（冻结模型梯度）
     score_fn = mutils.get_score_fn(sde, model, train=False, continuous=continuous)
     with torch.no_grad():
@@ -638,40 +642,47 @@ def likelihood_guided_step(
         A_0_hat = A_t
         c = torch.ones_like(A_t[:, :1, :1, :1])
 
-    # 3) 投影并构造可导副本（只对 A0_clean 求导，不回传投影）
-    A_0_clean = A_0_hat.squeeze(1) * mask.squeeze(1)  # [B, N, N]
+    # 3) 投影（不回传投影），构造可导副本
+    A_0_clean = A_0_hat.squeeze(1) * mask.squeeze(1)  # [B,N,N]
     decoder.eval()
     with torch.no_grad():
-        A_0_clean = decoder.project_adjacency(A_0_clean)  # 建议保持对称与零对角
-    A_0_var = A_0_clean.clone().detach().requires_grad_(True)
-
-    # 4) 似然梯度 g = ∇_{A0} log pψ(X|A0)
-    try:
-        _, loglik = decoder(A_0_var, X_obs, return_loglik=True)
-        if loglik is None or (hasattr(loglik, "requires_grad") and not loglik.requires_grad):
+        A_0_clean = decoder.project_adjacency(A_0_clean)
+    # 4) 似然梯度 g = ∇_{A0} log pψ(X|A0)，在局部开启梯度计算
+    with torch.enable_grad():
+        A_0_var = A_0_clean.clone().detach().requires_grad_(True)
+        try:
+            _, loglik = decoder(A_0_var, X_obs, return_loglik=True)
+            if loglik is None or (hasattr(loglik, "requires_grad") and not loglik.requires_grad):
+                grad_A0 = torch.zeros_like(A_0_var)
+            else:
+                grad_A0 = torch.autograd.grad(
+                    outputs=loglik, inputs=A_0_var, retain_graph=False, create_graph=False
+                )[0]
+        except Exception as e:
+            print(f"Gradient computation failed: {e}")
             grad_A0 = torch.zeros_like(A_0_var)
-        else:
-            grad_A0 = torch.autograd.grad(outputs=loglik, inputs=A_0_var, retain_graph=False, create_graph=False)[0]
-    except Exception as e:
-        print(f"Gradient computation failed: {e}")
-        grad_A0 = torch.zeros_like(A_0_var)
 
     # 结构一致性：对称、清零对角、乘 mask
     grad_A0 = 0.5 * (grad_A0 + grad_A0.transpose(-1, -2))
     grad_A0 = grad_A0 - torch.diag_embed(torch.diagonal(grad_A0, dim1=-2, dim2=-1))
     grad_A0 = grad_A0 * mask.squeeze(1)
 
-    # 5) 按样本自适应归一化
-    grad_flat = grad_A0.view(grad_A0.size(0), -1)
-    score_flat = original_score.view(original_score.size(0), -1)
-    grad_norm = grad_flat.norm(dim=1, keepdim=True)  # [B,1]
-    score_norm = score_flat.norm(dim=1, keepdim=True)  # [B,1]
-    adaptive = (guidance_weight * score_norm / (grad_norm + eps_stabilize)).view(-1, 1, 1, 1)  # [B,1,1,1]
+    # 5) 按掩码域自适应归一化，避免无效区域影响尺度
+    grad_flat = grad_A0.reshape(grad_A0.size(0), -1)
+    score_flat = (original_score * mask).reshape(original_score.size(0), -1)
+    grad_norm = grad_flat.norm(dim=1, keepdim=True)          # [B,1]
+    score_norm = score_flat.norm(dim=1, keepdim=True)        # [B,1]
+    # 分子/分母都加入 eps，避免 0/0 或除零导致 NaN/Inf
+    adaptive = (
+        guidance_weight * (score_norm + eps_stabilize) / (grad_norm + eps_stabilize)
+    ).view(-1, 1, 1, 1)
 
     # 6) 映射回 score 空间：∇_{At} = (1/c) ∇_{A0}
     guidance_term = adaptive * grad_A0.unsqueeze(1) / (c + eps_stabilize)  # [B,1,N,N]
     guidance_term = guidance_term * mask  # 保持结构
     guided_score = original_score + guidance_term
+    # 输出前进行数值清理，避免把 NaN/Inf 传回外层积分器
+    guided_score = torch.nan_to_num(guided_score, nan=0.0, posinf=0.0, neginf=0.0)
 
     return guided_score
 
@@ -689,12 +700,9 @@ def get_guided_pc_sampler(
     denoise=True,
     eps=1e-3,
     device="cuda",
-    decoder=None,
     guidance_weight=1.0,
 ):
     """Create a guided PC sampler with improved error handling."""
-
-    # Create predictor & corrector update functions
     predictor_update_fn = functools.partial(
         shared_predictor_update_fn,
         sde=sde,
@@ -706,25 +714,32 @@ def get_guided_pc_sampler(
         shared_corrector_update_fn, sde=sde, corrector=corrector, continuous=continuous, snr=snr, n_steps=n_steps
     )
 
-    def guided_pc_sampler(model, n_nodes_pmf, ts=None):
+    def guided_pc_sampler(model, n_nodes_pmf, decoder, ts=None):
         with torch.no_grad():
             x = sde.prior_sampling(shape).to(device)
-            # sample node counts
-            if isinstance(n_nodes_pmf, torch.Tensor):
-                probs = n_nodes_pmf
-            else:
-                probs = torch.tensor(n_nodes_pmf, device=device, dtype=torch.float)
+
+            # 节点数采样
+            probs = n_nodes_pmf if isinstance(n_nodes_pmf, torch.Tensor) else torch.tensor(n_nodes_pmf, device=device, dtype=torch.float)
             n_nodes = torch.multinomial(probs, shape[0], replacement=True).to(device)
 
-            edge_mask = torch.zeros_like(x)
-            for i, n in enumerate(n_nodes):
-                edge_mask[i, :, :n, :n] = 1.0
-            x = x * edge_mask
+            # 结构化 edge mask：节点外积 -> 下三角 -> 对称（清零对角）
+            node_mask = torch.zeros((shape[0], shape[-1]), device=device)
+            for i in range(shape[0]):
+                node_mask[i, : n_nodes[i]] = 1.0
+            edge_mask = (node_mask[:, None, :] * node_mask[:, :, None]).unsqueeze(1)
+            edge_mask = torch.tril(edge_mask, -1)
+            edge_mask = edge_mask + edge_mask.transpose(-1, -2)
 
+            x = x * edge_mask
             timesteps = torch.linspace(sde.T, eps, sde.N, device=device)
+
             for i in range(sde.N):
                 t = timesteps[i]
                 vec_t = torch.ones(shape[0], device=device) * t
+
+                # 先 corrector，再 predictor（与基线对齐）
+                x, x_mean = corrector_update_fn(x, vec_t, model=model, mask=edge_mask, ts=ts)
+                x = x * edge_mask
 
                 if decoder is not None and ts is not None:
                     guided_score = likelihood_guided_step(
@@ -738,7 +753,6 @@ def get_guided_pc_sampler(
                         guidance_weight=guidance_weight,
                         continuous=continuous,
                     )
-
                     # 用 guided score 构造一次性 predictor
                     def temp_score_fn(x_in, t_in, **kwargs):
                         return guided_score
@@ -752,17 +766,16 @@ def get_guided_pc_sampler(
                     x, x_mean = predictor_update_fn(x, vec_t, model=model, mask=edge_mask, ts=ts)
 
                 x = x * edge_mask
-                x, x_mean = corrector_update_fn(x, vec_t, model=model, mask=edge_mask, ts=ts)
-                x = x * edge_mask
 
             if denoise:
-                # 复用标准的 reverse diffusion 单步去噪，带 mask/ts
                 score_fn = get_score_fn(sde, model, train=False, continuous=True)
                 predictor_obj = ReverseDiffusionPredictor(sde, score_fn, probability_flow=False)
                 vec_eps = torch.ones(shape[0], device=device) * eps
                 _, x = predictor_obj.update_fn(x, vec_eps, mask=edge_mask, ts=ts)
                 x = x * edge_mask
 
-            return inverse_scaler(x), sde.N * (n_steps + 1), n_nodes
+            # 返回前进行一次防御性清理，避免 NaN/Inf 传播（不改变范围/分布）
+            x = torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
+            return inverse_scaler(x) * edge_mask, sde.N * (n_steps + 1), n_nodes
 
     return guided_pc_sampler
