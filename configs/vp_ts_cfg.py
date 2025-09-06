@@ -92,7 +92,18 @@ def get_config():
     model.beta_max = 5.0
     model.dropout = 0.0
     model.ts_cond = True
-    model.ts_in = 4
+    model.ts_in = 4  # 输入时间序列单步特征维度（需与 data.ts_features 对齐）
+
+    # ---- 以下为 PGSN 中 TemporalEncoder / 融合模块所需新增字段 ----
+    model.ts_hid = 64  # 隐藏/输出维度；PGSN 内若未提供则默认 nf//2，这里显式给出以保证可重复
+    model.ts_dropout = 0.1  # 时间序列编码与融合过程中的 dropout，映射到 TemporalEncoder 与融合 MLP
+    model.ts_fuse = "concat"  # 融合策略（当前实现仅支持 'concat'；更改需同步修改 pgsn.PGSN）
+    # ----------------------------------------------------------------
+
+    # 说明：
+    # 1. ts_hid 与 TemporalEncoder(out_dim) 一致；当前实现中 out_dim=hidden_dim
+    # 2. 修改 ts_hid 时无需改动主结构 nf；融合后会线性映射回 nf 维度
+    # 3. 若未来支持其他融合模式（如 add / gate），需在 PGSN 中扩展判断逻辑并更新此处注释
 
     # ============== Optim ==============
     config.optim = optim = ml_collections.ConfigDict()
