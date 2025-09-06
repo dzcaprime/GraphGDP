@@ -12,11 +12,11 @@ def get_config():
     training.continuous = True
     training.reduce_mean = True
 
-    training.batch_size = 32
-    training.eval_batch_size = 16
+    training.batch_size = 128
+    training.eval_batch_size = 128
     training.n_iters = 1500000
     training.snapshot_freq = 10000
-    training.log_freq = 200
+    training.log_freq = 500
     training.eval_freq = 5000
     training.snapshot_freq_for_preemption = 5000
     training.snapshot_sampling = False
@@ -44,7 +44,7 @@ def get_config():
     evaluate.begin_ckpt = 5
     evaluate.end_ckpt = 20
     evaluate.batch_size = 1024
-    evaluate.enable_sampling = False
+    evaluate.enable_sampling = True
     evaluate.num_samples = 1024
     evaluate.mmd_distance = 'RBF'
     evaluate.max_subgraph = False
