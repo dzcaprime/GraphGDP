@@ -627,7 +627,7 @@ def likelihood_guided_step(
     # 1) 原始 score（冻结模型梯度）
     score_fn = mutils.get_score_fn(sde, model, train=False, continuous=continuous)
     with torch.no_grad():
-        original_score = score_fn(A_t, t, mask=mask)  # [B, C, N, N]
+        original_score = score_fn(A_t, t, mask=mask, ts=X_obs)  # [B, C, N, N]
 
     # 2) Tweedie 去噪：A0_hat = (A_t + std^2 * score) / mean
     if hasattr(sde, "marginal_prob"):
