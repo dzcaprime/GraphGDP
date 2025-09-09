@@ -64,6 +64,24 @@ def get_corrector(name):
     return _CORRECTORS[name]
 
 
+def build_cfg_score_fn(sde, model, continuous: bool, cfg_scale: float | None):
+    """
+    构建支持 Classifier-Free Guidance 的 score 函数。
+    当 cfg_scale<=0 或无 ts 时退化为普通 score。
+    """
+    base_fn = mutils.get_score_fn(sde, model, train=False, continuous=continuous)
+
+    def _fn(x, t, mask=None, ts=None, **kw):
+        if cfg_scale is None or cfg_scale <= 0.0 or ts is None:
+            return base_fn(x, t, mask=mask, ts=ts, **kw)
+        # 双前向（无梯度），共享参数
+        s_cond = base_fn(x, t, mask=mask, ts=ts, **kw)
+        s_uncond = base_fn(x, t, mask=mask, ts=None, **kw)
+        return s_uncond + cfg_scale * (s_cond - s_uncond)
+
+    return _fn
+
+
 def get_sampling_fn(config, sde, shape, inverse_scaler, eps):
     """Create a sampling function.
 
@@ -122,6 +140,7 @@ def get_sampling_fn(config, sde, shape, inverse_scaler, eps):
             denoise=config.sampling.noise_removal,
             eps=eps,
             device=config.device,
+            cfg_scale=getattr(config.sampling, "cfg_scale", None),
         )
     elif sampler_name.lower() == "guided_pc":
         predictor = get_predictor(config.sampling.predictor.lower())
@@ -140,6 +159,7 @@ def get_sampling_fn(config, sde, shape, inverse_scaler, eps):
             eps=eps,
             device=config.device,
             guidance_weight=config.sampling.guidance_weight,
+            cfg_scale=getattr(config.sampling, "cfg_scale", None),
         )
     else:
         raise ValueError(f"Sampler name {sampler_name} unknown.")
@@ -298,28 +318,25 @@ class NoneCorrector(Corrector):
         return x, x
 
 
-def shared_predictor_update_fn(x, t, sde, model, predictor, probability_flow, continuous, *args, **kwargs):
-    """A wrapper that configures and returns the update function of predictors."""
-    score_fn = mutils.get_score_fn(sde, model, train=False, continuous=continuous)
+def shared_predictor_update_fn(
+    x, t, sde, model, predictor, probability_flow, continuous, cfg_scale=None, *args, **kwargs
+):
+    """支持 CFG 的 predictor 包装。"""
+    score_fn = build_cfg_score_fn(sde, model, continuous=continuous, cfg_scale=cfg_scale)
     if predictor is None:
-        # Corrector-only sampler
         predictor_obj = NonePredictor(sde, score_fn, probability_flow)
     else:
         predictor_obj = predictor(sde, score_fn, probability_flow)
-
     return predictor_obj.update_fn(x, t, *args, **kwargs)
 
 
-def shared_corrector_update_fn(x, t, sde, model, corrector, continuous, snr, n_steps, *args, **kwargs):
-    """A wrapper that configures and returns the update function of correctors."""
-    score_fn = mutils.get_score_fn(sde, model, train=False, continuous=continuous)
-
+def shared_corrector_update_fn(x, t, sde, model, corrector, continuous, snr, n_steps, cfg_scale=None, *args, **kwargs):
+    """支持 CFG 的 corrector 包装。"""
+    score_fn = build_cfg_score_fn(sde, model, continuous=continuous, cfg_scale=cfg_scale)
     if corrector is None:
-        # Predictor-only sampler
         corrector_obj = NoneCorrector(sde, score_fn, snr, n_steps)
     else:
         corrector_obj = corrector(sde, score_fn, snr, n_steps)
-
     return corrector_obj.update_fn(x, t, *args, **kwargs)
 
 
@@ -336,6 +353,7 @@ def get_pc_sampler(
     denoise=True,
     eps=1e-3,
     device="cuda",
+    cfg_scale: float | None = None,
 ):
     """Create a Predictor-Corrector (PC) sampler.
 
@@ -363,9 +381,16 @@ def get_pc_sampler(
         predictor=predictor,
         probability_flow=probability_flow,
         continuous=continuous,
+        cfg_scale=cfg_scale,
     )
     corrector_update_fn = functools.partial(
-        shared_corrector_update_fn, sde=sde, corrector=corrector, continuous=continuous, snr=snr, n_steps=n_steps
+        shared_corrector_update_fn,
+        sde=sde,
+        corrector=corrector,
+        continuous=continuous,
+        snr=snr,
+        n_steps=n_steps,
+        cfg_scale=cfg_scale,
     )
 
     def pc_sampler(model, n_nodes_pmf):
@@ -616,18 +641,24 @@ def likelihood_guided_step(
     guidance_weight: float = 1.0,
     eps_stabilize: float = 1e-8,
     continuous: bool = True,
+    cfg_scale: float | None = None,
 ):
     """
     单步似然引导采样（在 no_grad 外围下，局部开启梯度用于 decoder）。
     """
     # check data shape
     if X_obs.shape[2] != A_t.size(-1) and X_obs.shape[1] != A_t.size(-1):
-        X_obs = X_obs.permute(0,2,1,3).contiguous() # [B, N, T, C]-->[B, T, N, C]
-        
+        X_obs = X_obs.permute(0, 2, 1, 3).contiguous()  # [B, N, T, C]-->[B, T, N, C]
+
     # 1) 原始 score（冻结模型梯度）
-    score_fn = mutils.get_score_fn(sde, model, train=False, continuous=continuous)
+    score_fn_base = mutils.get_score_fn(sde, model, train=False, continuous=continuous)
     with torch.no_grad():
-        original_score = score_fn(A_t, t, mask=mask, ts=X_obs)  # [B, C, N, N]
+        if cfg_scale is not None and cfg_scale > 0.0 and X_obs is not None:
+            s_cond = score_fn_base(A_t, t, mask=mask, ts=X_obs)
+            s_uncond = score_fn_base(A_t, t, mask=mask, ts=None)
+            original_score = s_uncond + cfg_scale * (s_cond - s_uncond)
+        else:
+            original_score = score_fn_base(A_t, t, mask=mask, ts=X_obs)  # [B, C, N, N]
 
     # 2) Tweedie 去噪：A0_hat = (A_t + std^2 * score) / mean
     if hasattr(sde, "marginal_prob"):
@@ -655,9 +686,7 @@ def likelihood_guided_step(
             if loglik is None or (hasattr(loglik, "requires_grad") and not loglik.requires_grad):
                 grad_A0 = torch.zeros_like(A_0_var)
             else:
-                grad_A0 = torch.autograd.grad(
-                    outputs=loglik, inputs=A_0_var, retain_graph=False, create_graph=False
-                )[0]
+                grad_A0 = torch.autograd.grad(outputs=loglik, inputs=A_0_var, retain_graph=False, create_graph=False)[0]
         except Exception as e:
             print(f"Gradient computation failed: {e}")
             grad_A0 = torch.zeros_like(A_0_var)
@@ -670,12 +699,10 @@ def likelihood_guided_step(
     # 5) 按掩码域自适应归一化，避免无效区域影响尺度
     grad_flat = grad_A0.reshape(grad_A0.size(0), -1)
     score_flat = (original_score * mask).reshape(original_score.size(0), -1)
-    grad_norm = grad_flat.norm(dim=1, keepdim=True)          # [B,1]
-    score_norm = score_flat.norm(dim=1, keepdim=True)        # [B,1]
+    grad_norm = grad_flat.norm(dim=1, keepdim=True)  # [B,1]
+    score_norm = score_flat.norm(dim=1, keepdim=True)  # [B,1]
     # 分子/分母都加入 eps，避免 0/0 或除零导致 NaN/Inf
-    adaptive = (
-        guidance_weight * (score_norm + eps_stabilize) / (grad_norm + eps_stabilize)
-    ).view(-1, 1, 1, 1)
+    adaptive = (guidance_weight * (score_norm + eps_stabilize) / (grad_norm + eps_stabilize)).view(-1, 1, 1, 1)
 
     # 6) 映射回 score 空间：∇_{At} = (1/c) ∇_{A0}
     guidance_term = adaptive * grad_A0.unsqueeze(1) / (c + eps_stabilize)  # [B,1,N,N]
@@ -683,6 +710,12 @@ def likelihood_guided_step(
     guided_score = original_score + guidance_term
     # 输出前进行数值清理，避免把 NaN/Inf 传回外层积分器
     guided_score = torch.nan_to_num(guided_score, nan=0.0, posinf=0.0, neginf=0.0)
+
+    # 计算 ratio 供调试（不改变返回接口）
+    with torch.no_grad():
+        num = guidance_term.reshape(guidance_term.size(0), -1).norm(dim=1) + eps_stabilize
+        den = original_score.reshape(original_score.size(0), -1).norm(dim=1) + eps_stabilize
+        ratio = (num / den).mean()  # 可在外部按需打印
 
     return guided_score
 
@@ -701,6 +734,7 @@ def get_guided_pc_sampler(
     eps=1e-3,
     device="cuda",
     guidance_weight=1.0,
+    cfg_scale: float | None = None,
 ):
     """Create a guided PC sampler with improved error handling."""
     predictor_update_fn = functools.partial(
@@ -709,9 +743,16 @@ def get_guided_pc_sampler(
         predictor=predictor,
         probability_flow=probability_flow,
         continuous=continuous,
+        cfg_scale=cfg_scale,
     )
     corrector_update_fn = functools.partial(
-        shared_corrector_update_fn, sde=sde, corrector=corrector, continuous=continuous, snr=snr, n_steps=n_steps
+        shared_corrector_update_fn,
+        sde=sde,
+        corrector=corrector,
+        continuous=continuous,
+        snr=snr,
+        n_steps=n_steps,
+        cfg_scale=cfg_scale,
     )
 
     def guided_pc_sampler(model, n_nodes_pmf, decoder, ts=None):
@@ -719,7 +760,11 @@ def get_guided_pc_sampler(
             x = sde.prior_sampling(shape).to(device)
 
             # 节点数采样
-            probs = n_nodes_pmf if isinstance(n_nodes_pmf, torch.Tensor) else torch.tensor(n_nodes_pmf, device=device, dtype=torch.float)
+            probs = (
+                n_nodes_pmf
+                if isinstance(n_nodes_pmf, torch.Tensor)
+                else torch.tensor(n_nodes_pmf, device=device, dtype=torch.float)
+            )
             n_nodes = torch.multinomial(probs, shape[0], replacement=True).to(device)
 
             # 结构化 edge mask：节点外积 -> 下三角 -> 对称（清零对角）
@@ -752,9 +797,10 @@ def get_guided_pc_sampler(
                         mask=edge_mask,
                         guidance_weight=guidance_weight,
                         continuous=continuous,
+                        cfg_scale=cfg_scale,
                     )
-                    # 用 guided score 构造一次性 predictor
-                    def temp_score_fn(x_in, t_in, **kwargs):
+
+                    def temp_score_fn(x_in, t_in, **_):
                         return guided_score
 
                     if predictor is None:
@@ -764,9 +810,8 @@ def get_guided_pc_sampler(
                         x, x_mean = predictor_obj.update_fn(x, vec_t, mask=edge_mask, ts=ts)
                 else:
                     x, x_mean = predictor_update_fn(x, vec_t, model=model, mask=edge_mask, ts=ts)
-
                 x = x * edge_mask
-
+            # ...existing code (denoise + 清理 + 返回)...
             if denoise:
                 score_fn = get_score_fn(sde, model, train=False, continuous=True)
                 predictor_obj = ReverseDiffusionPredictor(sde, score_fn, probability_flow=False)

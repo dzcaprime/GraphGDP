@@ -48,12 +48,13 @@ def get_config():
     sampling.snr = 0.16
     sampling.vis_row = 4
     sampling.vis_col = 4
-    sampling.guidance_weight = 0.0  # 引导采样权重
+    sampling.guidance_weight = 0.0  # decoder引导采样权重
+    sampling.cfg_scale = 2.0  # CFG guidance scale (w)，典型 1.5~2.5
 
     # ============== Evaluation ==============
     config.eval = evaluate = ml_collections.ConfigDict()
-    evaluate.begin_ckpt = 5
-    evaluate.end_ckpt = 20
+    evaluate.begin_ckpt = 60
+    evaluate.end_ckpt = 110
     evaluate.batch_size = 1000
     evaluate.enable_sampling = True
     evaluate.num_samples = 1000
@@ -93,17 +94,13 @@ def get_config():
     model.dropout = 0.0
     model.ts_cond = True
     model.ts_in = 4  # 输入时间序列单步特征维度（需与 data.ts_features 对齐）
+    model.cfg_uncond_prob = 0.12  # p_uncond：训练阶段随机无条件概率 (0.1~0.15 推荐)
 
     # ---- 以下为 PGSN 中 TemporalEncoder / 融合模块所需新增字段 ----
     model.ts_hid = 64  # 隐藏/输出维度；PGSN 内若未提供则默认 nf//2，这里显式给出以保证可重复
     model.ts_dropout = 0.1  # 时间序列编码与融合过程中的 dropout，映射到 TemporalEncoder 与融合 MLP
     model.ts_fuse = "concat"  # 融合策略（当前实现仅支持 'concat'；更改需同步修改 pgsn.PGSN）
-    # ----------------------------------------------------------------
-
-    # 说明：
-    # 1. ts_hid 与 TemporalEncoder(out_dim) 一致；当前实现中 out_dim=hidden_dim
-    # 2. 修改 ts_hid 时无需改动主结构 nf；融合后会线性映射回 nf 维度
-    # 3. 若未来支持其他融合模式（如 add / gate），需在 PGSN 中扩展判断逻辑并更新此处注释
+    model.cfg_uncond_prob = 0.12  # p_uncond：训练阶段随机无条件概率 (0.1~0.15 推荐)
 
     # ============== Optim ==============
     config.optim = optim = ml_collections.ConfigDict()

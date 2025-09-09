@@ -1,8 +1,6 @@
 import torch.nn as nn
 import torch
 import functools
-from torch_geometric.utils import dense_to_sparse
-
 from . import utils, layers, gnns
 from .ts_encoder import TemporalEncoder  # 新增：时间序列编码器
 
@@ -30,11 +28,12 @@ class PGSN(nn.Module):
 
         # ====== 时间条件（可选）======
         self.use_ts = config.model.ts_cond
+        self.cfg_uncond_prob = config.model.cfg_uncond_prob if self.use_ts else 0.0
         if self.use_ts:
             ts_in = config.data.ts_features
             ts_hid = config.model.ts_hid
             ts_dropout = config.model.ts_dropout
-            self.ts_fuse_mode = config.model.ts_fuse_mode.lower()
+            self.ts_fuse_mode = config.model.ts_fuse.lower()
             if self.ts_fuse_mode != "concat":
                 raise ValueError(f"当前仅实现 concat 融合，收到 {self.ts_fuse_mode}")
             # TemporalEncoder 输出维度设为 ts_hid，后续线性映射回 nf
@@ -52,6 +51,11 @@ class PGSN(nn.Module):
                 nn.GELU(),
                 nn.LayerNorm(nf),
             )
+            # 若需要做 CFG，则增加 cond/uncond 指示嵌入 (2 -> nf*4)
+            if self.cfg_uncond_prob > 0:
+                self.cond_embed = nn.Linear(2, nf * 4)
+            else:
+                self.cond_embed = None
         # ====== 其余模块 ======
         modules = []
         # timestep/noise_level embedding; only for continuous training
@@ -195,28 +199,44 @@ class PGSN(nn.Module):
         x_degree = modules[m_idx](x_degree)  # [B,N,nf]
         m_idx += 1
 
-        # ====== 时间序列条件融合（concat 模式）======
+        # ---------- 条件指示 (CFG 训练) ----------
+        cond_mask = None  # True 表示使用 ts 条件；False 表示无条件
+        if self.use_ts and self.cfg_uncond_prob > 0:
+            ts_in_batch = kwargs.get("ts", None)
+            if self.training and ts_in_batch is not None:
+                # 采样 Bernoulli：1 表示“无条件”(drop)，转成 cond_mask False
+                drop = torch.bernoulli(
+                    torch.full((x.size(0),), self.cfg_uncond_prob, device=x.device)
+                ).to(torch.bool)
+                cond_mask = ~drop  # True=有条件
+            elif ts_in_batch is not None:
+                cond_mask = torch.ones(x.size(0), dtype=torch.bool, device=x.device)
+            else:
+                cond_mask = torch.zeros(x.size(0), dtype=torch.bool, device=x.device)
+
+            if self.cond_embed is not None:
+                # one-hot: [uncond, cond]
+                onehot = torch.stack([~cond_mask, cond_mask], dim=1).to(torch.float32)
+                temb = temb + self.cond_embed(onehot)
+
+        # ====== 时间序列条件融合（concat + CFG dropout）======
         if self.use_ts:
             ts_raw = kwargs.get("ts", None)
-            if ts_raw is not None:
-                # 期望 [B,T,N,D]；若为 [B,N,T,D] 则转置
-                if ts_raw.dim() == 4:
-                    if ts_raw.size(2) == x_degree.size(1) and ts_raw.size(1) != x_degree.size(1):
-                        # [B,N,T,D] -> [B,T,N,D]
-                        ts_raw = ts_raw.permute(0, 2, 1, 3).contiguous()
-                    elif ts_raw.size(1) != x_degree.size(1) and ts_raw.size(2) != x_degree.size(1):
-                        # 不匹配节点数，放弃融合（静默跳过，保持稳健）
-                        ts_raw = None
-                else:
-                    ts_raw = None
-            if ts_raw is not None:
-                ts_emb = self.temporal_encoder(ts_raw)  # [B,N,ts_hid]
-                if ts_emb.size(1) == x_degree.size(0):  # 容错：防误传形状
-                    pass
-                if ts_emb.size(1) == x_degree.size(1):
-                    x_degree = self.ts_fuse(torch.cat([x_degree, ts_emb], dim=-1))
-                # 若维度仍不匹配则安全跳过
-
+            assert ts_raw is not None, "需要提供时间序列 ts 条件"
+            # expect ts_raw shape [B, T, N, D]
+            assert ts_raw.size(2) == x_degree.size(1), "ts节点数应与x节点数匹配"
+            # 简化：编码全 batch；若需进一步提速，可只编码 cond_mask==True 子集
+            ts_emb = self.temporal_encoder(ts_raw)  # [B,N,ts_hid]
+            assert ts_emb.size(1) == x_degree.size(1), "ts_emb节点数应与x节点数匹配"
+            if cond_mask is None or cond_mask.all():
+                x_degree = self.ts_fuse(torch.cat([x_degree, ts_emb], dim=-1))
+            elif (~cond_mask).all():
+                pass  # 全部无条件直接跳过
+            else:
+                fused = self.ts_fuse(torch.cat([x_degree[cond_mask], ts_emb[cond_mask]], dim=-1))
+                x_deg_clone = x_degree.clone()
+                x_deg_clone[cond_mask] = fused
+                x_degree = x_deg_clone
         # ====== 位置编码 ======
         x_pos = modules[m_idx](x_pos)
         m_idx += 1
@@ -225,19 +245,18 @@ class PGSN(nn.Module):
         x_degree = x_degree.reshape(-1, self.x_ch)
         x_pos = x_pos.reshape(-1, self.pos_ch)
 
-        # 从 batched 稠密邻接安全构造与 [B*N, ·] 对齐的 edge_index
+        # 从 batched 稠密邻接安全构造 edge_index
         B, N, _ = cont_adj.shape
-        dense_index = cont_adj.nonzero(as_tuple=True)  # (b,i,j)
-        idx = cont_adj.nonzero(as_tuple=False)        # [E,3]
+        dense_index = cont_adj.nonzero(as_tuple=True)
+        idx = cont_adj.nonzero(as_tuple=False)
         if idx.numel() == 0:
-            # 哑元边，避免空图在下游 GNN 中崩溃（索引 0 始终有效）
             device = cont_adj.device
             edge_index = torch.zeros((2, 1), dtype=torch.long, device=device)
         else:
             b = idx[:, 0]; i = idx[:, 1]; j = idx[:, 2]
             row = i + b * N
             col = j + b * N
-            edge_index = torch.stack((row, col), dim=0)  # [2, E]
+            edge_index = torch.stack((row, col), dim=0)
 
         # Run GNN layers
         h_dense_edge = modules[m_idx](
