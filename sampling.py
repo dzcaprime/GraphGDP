@@ -140,7 +140,7 @@ def get_sampling_fn(config, sde, shape, inverse_scaler, eps):
             denoise=config.sampling.noise_removal,
             eps=eps,
             device=config.device,
-            cfg_scale=getattr(config.sampling, "cfg_scale", None),
+            cfg_scale=config.sampling.cfg_scale,
         )
     elif sampler_name.lower() == "guided_pc":
         predictor = get_predictor(config.sampling.predictor.lower())
@@ -159,7 +159,7 @@ def get_sampling_fn(config, sde, shape, inverse_scaler, eps):
             eps=eps,
             device=config.device,
             guidance_weight=config.sampling.guidance_weight,
-            cfg_scale=getattr(config.sampling, "cfg_scale", None),
+            cfg_scale=config.sampling.cfg_scale,
         )
     else:
         raise ValueError(f"Sampler name {sampler_name} unknown.")
@@ -646,19 +646,19 @@ def likelihood_guided_step(
     """
     单步似然引导采样（在 no_grad 外围下，局部开启梯度用于 decoder）。
     """
-    # check data shape
-    if X_obs.shape[2] != A_t.size(-1) and X_obs.shape[1] != A_t.size(-1):
-        X_obs = X_obs.permute(0, 2, 1, 3).contiguous()  # [B, N, T, C]-->[B, T, N, C]
-
     # 1) 原始 score（冻结模型梯度）
     score_fn_base = mutils.get_score_fn(sde, model, train=False, continuous=continuous)
     with torch.no_grad():
-        if cfg_scale is not None and cfg_scale > 0.0 and X_obs is not None:
-            s_cond = score_fn_base(A_t, t, mask=mask, ts=X_obs)
+        if X_obs is not None:  # 有条件输入
+            s_cond   = score_fn_base(A_t, t, mask=mask, ts=X_obs)
             s_uncond = score_fn_base(A_t, t, mask=mask, ts=None)
-            original_score = s_uncond + cfg_scale * (s_cond - s_uncond)
-        else:
-            original_score = score_fn_base(A_t, t, mask=mask, ts=X_obs)  # [B, C, N, N]
+            w = 1.0 if cfg_scale is None else float(cfg_scale)
+            original_score = s_uncond + w * (s_cond - s_uncond)
+        else:  # 没有条件输入
+            original_score = score_fn_base(A_t, t, mask=mask, ts=None)# [B, C, N, N]
+
+    if guidance_weight is None or guidance_weight <= 0.0:
+        return original_score  # 不进行引导
 
     # 2) Tweedie 去噪：A0_hat = (A_t + std^2 * score) / mean
     if hasattr(sde, "marginal_prob"):

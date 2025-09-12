@@ -12,7 +12,7 @@ import time
 from absl import flags
 from torch.utils import tensorboard
 from torch_geometric.loader import DataLoader
-import networkx as nx  # 兼容 NetworkX 3.x
+import networkx as nx
 
 if not hasattr(nx, "from_numpy_matrix"):
     nx.from_numpy_matrix = nx.from_numpy_array
@@ -28,6 +28,7 @@ import sde_lib
 from sklearn.metrics import roc_auc_score
 from utils import *
 from train_dec import train_temporal_decoder  # 新增：导入解码器训练函数
+
 
 def _compute_batch_auroc(preds: torch.Tensor, target: torch.Tensor, mask: torch.Tensor) -> float:
     """
@@ -160,6 +161,7 @@ def set_random_seed(config):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
+
 def sde_train_with_decoder(config, workdir):
     """
     两阶段训练管线：
@@ -188,10 +190,6 @@ def sde_train_with_decoder(config, workdir):
 
     # 新增：统一构造 batch 的小工具，假设输入一定包含 adj/mask/ts
     def _make_batch(graphs: dict) -> dict:
-        """
-        规范化一个 batch，假设 graphs 包含 'adj'、'mask'、'ts' 三个键。
-        - 提前做归一化与设备迁移，减少后续分支。
-        """
         return {
             "adj": scaler(graphs["adj"]).to(config.device),
             "mask": graphs["mask"].to(config.device),
@@ -256,11 +254,7 @@ def sde_train_with_decoder(config, workdir):
     reduce_mean = config.training.reduce_mean
     likelihood_weighting = config.training.likelihood_weighting
     loss_fn = losses.get_sde_loss_fn(
-        sde, 
-        train=True, 
-        reduce_mean=reduce_mean, 
-        continuous=continuous, 
-        likelihood_weighting=likelihood_weighting
+        sde, train=True, reduce_mean=reduce_mean, continuous=continuous, likelihood_weighting=likelihood_weighting
     )
     eval_step_fn = losses.get_step_fn(
         sde,
@@ -328,7 +322,10 @@ def sde_train_with_decoder(config, workdir):
             writer.add_scalar("train/loss_base", base_loss.item(), step)
             writer.add_scalar("train/loss_joint", joint_loss.item(), step)
             writer.add_scalar("train/loss_total", total_loss.item(), step)
-            logging.info("step: %d, loss_base: %.5e, loss_joint: %.5e, loss_total: %.5e" % (step, base_loss.item(), joint_loss.item(), total_loss.item()))
+            logging.info(
+                "step: %d, loss_base: %.5e, loss_joint: %.5e, loss_total: %.5e"
+                % (step, base_loss.item(), joint_loss.item(), total_loss.item())
+            )
 
         # 抢占式快照（与 sde_train 对齐）
         if step != 0 and step % snapshot_freq_preempt == 0:
@@ -376,12 +373,21 @@ def sde_train_with_decoder(config, workdir):
                 # 采样条件 ts（优先 eval_ds）
                 if config.data.temporal:
                     B = config.training.eval_batch_size
-                    idxs = np.random.choice(len(eval_ds) if len(eval_ds) > 0 else len(train_ds), B, replace=True)
-                    src_ds = eval_ds if len(eval_ds) > 0 else train_ds
-                    ts_cond = torch.stack([src_ds[i]["ts"] for i in idxs]).to(config.device)
+                    # 随机索引一批测试样本，配对构造条件与真值
+                    idxs = np.random.randint(len(eval_ds), size=B).tolist()
+                    ts_batch = (
+                        torch.stack([eval_ds[i]["ts"] for i in idxs]).to(config.device)
+                        if config.data.temporal
+                        else None
+                    )
+                    true_adj_batch = torch.stack([eval_ds[i]["adj"] for i in idxs]).to(config.device)
+                    mask_batch = torch.stack([eval_ds[i]["mask"] for i in idxs]).to(config.device)
                 else:
-                    ts_cond = None
-                _, _, _ = sampling_fn(score_model, n_node_pmf, ts=ts_cond)
+                    ts_batch = None
+                # 采样与评估
+                pred_adj_batch, _, _ = sampling_fn(score_model, n_node_pmf, decoder, ts=ts_batch)
+                batch_auc = _compute_batch_auroc(pred_adj_batch, true_adj_batch, mask_batch)
+                logging.info(f"step {step}, snapshot sampling AUROC: {batch_auc:.5f}")
                 ema.restore(score_model.parameters())
 
     writer.close()
@@ -473,7 +479,9 @@ def sde_eval_with_decoder(config, workdir, eval_folder="eval"):
     sampling_fn = sampling.get_sampling_fn(config, sde, sampling_shape, inverse_scaler, sampling_eps)
 
     begin_ckpt = config.eval.begin_ckpt
+    end_ckpt = config.eval.end_ckpt
     logging.info("begin checkpoint: %d" % (begin_ckpt,))
+    logging.info("end checkpoint: %d" % (end_ckpt,))
 
     for ckpt in range(begin_ckpt, config.eval.end_ckpt + 1):
         # 等待 checkpoint
@@ -506,12 +514,7 @@ def sde_eval_with_decoder(config, workdir, eval_folder="eval"):
         for r in range(num_rounds):
             # 随机索引一批测试样本，配对构造条件与真值
             idxs = np.random.randint(len(test_ds), size=B).tolist()
-            ts_batch = (
-                torch.stack([test_ds[i]["ts"] for i in idxs]).to(config.device)
-                if config.data.temporal
-                else None
-            )
-            ts_batch = ts_batch.permute(0, 2, 1, 3).contiguous() if ts_batch is not None else None  # [B,N,T,C] -> [B,T,N,C]
+            ts_batch = torch.stack([test_ds[i]["ts"] for i in idxs]).to(config.device) if config.data.temporal else None
             true_adj_batch = torch.stack([test_ds[i]["adj"] for i in idxs]).to(config.device)
             mask_batch = torch.stack([test_ds[i]["mask"] for i in idxs]).to(config.device)
 
@@ -534,7 +537,6 @@ def sde_eval_with_decoder(config, workdir, eval_folder="eval"):
 run_train_dict = {"sde_with_decoder": sde_train_with_decoder, "sde": sde_train}
 
 run_eval_dict = {"sde": sde_evaluate, "sde_with_decoder": sde_eval_with_decoder}
-
 
 
 def train(config, workdir):
