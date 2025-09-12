@@ -1,7 +1,6 @@
 import torch.nn as nn
 import torch
 import functools
-from torch_geometric.utils import dense_to_sparse
 
 from . import utils, layers, gnns
 

@@ -1,16 +1,11 @@
 import torch
-import json
 import os
 import numpy as np
-import os.path as osp
-import pandas as pd
 import pickle as pk
 from torch.utils.data import Dataset
 import torch_geometric.transforms as T
-from torch_geometric.data import Data, InMemoryDataset, download_url
+from torch_geometric.data import InMemoryDataset
 from torch_geometric.utils import from_networkx, degree, to_networkx
-
-import data
 
 
 class NRISpringsDataset(Dataset):

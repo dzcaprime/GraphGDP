@@ -12,26 +12,20 @@ import time
 from absl import flags
 from torch.utils import tensorboard
 from torch_geometric.loader import DataLoader
-import pickle
-import networkx as nx  # 兼容 NetworkX 3.x
-
+import networkx as nx  
 if not hasattr(nx, "from_numpy_matrix"):
     nx.from_numpy_matrix = nx.from_numpy_array
 
-from models import pgsn
 import losses
 import sampling
 from models import utils as mutils
 from models.temporal_decoder import TemporalDecoder  # 新增：导入时序解码器
 from models.ema import ExponentialMovingAverage
 import datasets
-from evaluation import get_stats_eval, get_nn_eval
 from run_lib_backup import sde_train, sde_evaluate
 import sde_lib
-import visualize
 from sklearn.metrics import roc_auc_score
 from utils import *
-from torch_geometric.data import Data  # 增加：用于构造评估用 Data 对象
 from train_dec import train_temporal_decoder  # 新增：导入解码器训练函数
 
 
