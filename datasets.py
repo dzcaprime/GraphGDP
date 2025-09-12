@@ -92,6 +92,8 @@ class NRISpringsDataset(Dataset):
         A = np.clip(A, 0, 1)
         X = self.feat[i]  # [N,L,C]
         ts = X  # [N,L,C]
+        # change ts from [N,L,C] to [L, N, C] 
+        ts = np.transpose(ts, (1, 0, 2))
         adj = torch.from_numpy(A[None, ...])  # [1,N,N]
         # 将对角置零，避免自环；保持上下三角可用于模型前向
         mask = torch.ones_like(adj)
