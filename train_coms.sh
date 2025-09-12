@@ -4,4 +4,8 @@
 
 #CUDA_VISIBLE_DEVICES=2 python main.py --config configs/vp_com_small_pgsn.py --mode eval --config.eval.begin_ckpt 20 --config.eval.end_ckpt 20 --workdir exp/vp_com_small_default
 
-CUDA_VISIBLE_DEVICES=0 python main.py --config configs/vp_temporal_guided.py --mode eval --workdir work/temporal
+# CUDA_VISIBLE_DEVICES=0 python main.py --config configs/vp_ts_cfg.py --mode eval --workdir work/ts_cfg_springs10
+
+# CUDA_VISIBLE_DEVICES=0 python main.py --config configs/vp_ts_cfg.py --mode train --workdir work/ts_cfg_film_springs10
+
+CUDA_VISIBLE_DEVICES=3 python main.py --config configs/vp_ts_cfg.py --mode train --workdir work/ts_cfg_both_springs10
