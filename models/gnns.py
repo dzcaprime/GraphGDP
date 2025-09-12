@@ -1,11 +1,25 @@
 import torch.nn as nn
 import torch
+import math
 from .trans_layers import *
 
 
 class pos_gnn(nn.Module):
-    def __init__(self, act, x_ch, pos_ch, out_ch, max_node, graph_layer, n_layers=3, edge_dim=None, heads=4,
-                 temb_dim=None, dropout=0.1, attn_clamp=False):
+    def __init__(
+        self,
+        act,
+        x_ch,
+        pos_ch,
+        out_ch,
+        max_node,
+        graph_layer,
+        n_layers=3,
+        edge_dim=None,
+        heads=4,
+        temb_dim=None,
+        dropout=0.1,
+        attn_clamp=False,
+    ):
         super().__init__()
         self.out_ch = out_ch
         self.Dropout_0 = nn.Dropout(dropout)
@@ -25,15 +39,26 @@ class pos_gnn(nn.Module):
 
         for i in range(n_layers):
             if i == 0:
-                self.convs.append(eval(graph_layer)(x_ch, pos_ch, self.out_ch//heads, heads, edge_dim=edge_dim*2,
-                                                    act=act, attn_clamp=attn_clamp))
+                self.convs.append(
+                    eval(graph_layer)(
+                        x_ch, pos_ch, self.out_ch // heads, heads, edge_dim=edge_dim * 2, act=act, attn_clamp=attn_clamp
+                    )
+                )
             else:
-                self.convs.append(eval(graph_layer)
-                                  (self.out_ch, pos_ch, self.out_ch//heads, heads, edge_dim=edge_dim*2, act=act,
-                                   attn_clamp=attn_clamp))
-            self.edge_convs.append(nn.Linear(self.out_ch, edge_dim*2))
+                self.convs.append(
+                    eval(graph_layer)(
+                        self.out_ch,
+                        pos_ch,
+                        self.out_ch // heads,
+                        heads,
+                        edge_dim=edge_dim * 2,
+                        act=act,
+                        attn_clamp=attn_clamp,
+                    )
+                )
+            self.edge_convs.append(nn.Linear(self.out_ch, edge_dim * 2))
 
-    def forward(self, x_degree, x_pos, edge_index, dense_ori, dense_spd, dense_index, temb=None):
+    def forward(self, x_degree, x_pos, edge_index, dense_ori, dense_spd, dense_index, temb=None, attn_bias_sparse=None):
         """
         Args:
             x_degree: node degree feature [B*N, x_ch]
@@ -43,6 +68,7 @@ class pos_gnn(nn.Module):
             dense_spd: edge shortest path distance feature [B, N, N, nf//2]
             dense_index
             temb: [B, temb_dim]
+            atten_bias_sparse: [edge_length, heads]
         """
 
         B, N, _, _ = dense_ori.shape
@@ -64,15 +90,21 @@ class pos_gnn(nn.Module):
 
         for i_layer in range(self.n_layers):
             h_edge = dense_edge[dense_index]
-            # update node feature
-            h, h_pos = self.convs[i_layer](h, h_pos, edge_index, h_edge)
+            # update node feature - 支持注意力偏置
+            if attn_bias_sparse is not None:
+                try:
+                    h, h_pos = self.convs[i_layer](h, h_pos, edge_index, h_edge, attn_bias=attn_bias_sparse)
+                except TypeError:
+                    h, h_pos = self.convs[i_layer](h, h_pos, edge_index, h_edge)
+            else:
+                h, h_pos = self.convs[i_layer](h, h_pos, edge_index, h_edge)
             h = self.Dropout_0(h)
             h_pos = self.Dropout_0(h_pos)
 
             # update dense edge feature
             h_dense_node = h.reshape(B, N, -1)
             cur_edge_attr = h_dense_node.unsqueeze(1) + h_dense_node.unsqueeze(2)  # [B, N, N, nf]
-            dense_edge = (dense_edge + self.act(self.edge_convs[i_layer](cur_edge_attr))) / math.sqrt(2.)
+            dense_edge = (dense_edge + self.act(self.edge_convs[i_layer](cur_edge_attr))) / math.sqrt(2.0)
             dense_edge = self.Dropout_0(dense_edge)
 
         # Concat edge attribute

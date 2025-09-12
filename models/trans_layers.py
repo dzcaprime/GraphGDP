@@ -71,7 +71,8 @@ class PosTransLayer(MessagePassing):
     def forward(self, x: OptTensor,
                 pos: Tensor,
                 edge_index: Adj,
-                edge_attr: OptTensor = None
+                edge_attr: OptTensor = None,
+                attn_bias: OptTensor = None
                 ) -> Tuple[Tensor, Tensor]:
         """Explicit message passing implementation without propagate kwargs."""
         H, C = self.heads, self.out_channels
@@ -97,6 +98,11 @@ class PosTransLayer(MessagePassing):
 
         # attention
         alpha = (q_i * k_j * e0).sum(dim=-1) / math.sqrt(C)       # [E, H]
+        # new: attention bias
+        if attn_bias is not None:
+            if attn_bias.dim() != 2 or attn_bias.size(0) != alpha.size(0) or attn_bias.size(1) != H:
+                raise ValueError(f"attn_bias must be [E,H], got {tuple(attn_bias.shape)}")
+            alpha = alpha + attn_bias
         if self.attn_clamp:
             alpha = alpha.clamp(min=-5., max=5.)
         alpha = softmax(alpha, dst, num_nodes=N)                  # [E, H]

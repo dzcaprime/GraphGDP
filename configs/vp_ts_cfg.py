@@ -19,14 +19,14 @@ def get_config():
     training.sde = "vpsde"
     training.continuous = True
     training.reduce_mean = True
-    training.batch_size = 128
-    training.eval_batch_size = 128
+    training.batch_size = 256
+    training.eval_batch_size = 256
     training.n_iters = 1500000
     training.snapshot_freq = 10000
     training.log_freq = 500
     training.eval_freq = 5000
     training.snapshot_freq_for_preemption = 5000
-    training.snapshot_sampling = False
+    training.snapshot_sampling = True # sampling in training snapshots
     training.likelihood_weighting = False
 
     # 本文件特有：解码器与引导采样配置（保留）
@@ -94,13 +94,23 @@ def get_config():
     model.dropout = 0.0
     model.ts_cond = True
     model.ts_in = 4  # 输入时间序列单步特征维度（需与 data.ts_features 对齐）
-    model.cfg_uncond_prob = 0.12  # p_uncond：训练阶段随机无条件概率 (0.1~0.15 推荐)
 
     # ---- 以下为 PGSN 中 TemporalEncoder / 融合模块所需新增字段 ----
     model.ts_hid = 64  # 隐藏/输出维度；PGSN 内若未提供则默认 nf//2，这里显式给出以保证可重复
     model.ts_dropout = 0.1  # 时间序列编码与融合过程中的 dropout，映射到 TemporalEncoder 与融合 MLP
-    model.ts_fuse = "concat"  # 融合策略（当前实现仅支持 'concat'；更改需同步修改 pgsn.PGSN）
+    model.ts_fuse = "both"  # 融合策略（concat, film, both）
     model.cfg_uncond_prob = 0.12  # p_uncond：训练阶段随机无条件概率 (0.1~0.15 推荐)
+
+    #===============FiLM================
+    model.film = film = ml_collections.ConfigDict()
+    film.enable_node = True       # 节点级 FiLM (A)
+    film.enable_edge = True      # 边级 FiLM (B)
+    film.enable_attn_bias = True # 注意力偏置 FiLM (C)
+    film.hidden = 64              # FiLM 头隐藏维度
+    film.dropout = 0.1            # FiLM 头 dropout
+    film.gamma_range = [0.5, 1.5] # gamma 缩放范围
+    film.beta_scale = 0.1         # beta 偏置尺度
+    film.warmup = 0.1             # warmup 比例
 
     # ============== Optim ==============
     config.optim = optim = ml_collections.ConfigDict()
