@@ -12,7 +12,8 @@ import time
 from absl import flags
 from torch.utils import tensorboard
 from torch_geometric.loader import DataLoader
-import networkx as nx  
+import networkx as nx
+
 if not hasattr(nx, "from_numpy_matrix"):
     nx.from_numpy_matrix = nx.from_numpy_array
 
@@ -20,61 +21,14 @@ import losses
 import sampling
 from models import utils as mutils
 from models.temporal_decoder import TemporalDecoder  # 新增：导入时序解码器
+from models.RNNdecoder import RNNDecoder  # 新增：导入RNN解码器
 from models.ema import ExponentialMovingAverage
 import datasets
 from run_lib_backup import sde_train, sde_evaluate
 import sde_lib
-from sklearn.metrics import roc_auc_score
 from utils import *
 from train_dec import train_temporal_decoder  # 新增：导入解码器训练函数
-
-
-def edge_accuracy(preds, target, threshold=0.5):
-    """Compute edge accuracy for predicted vs target adjacency matrices.
-
-    Args:
-        preds: [B, 1, N, N] or [B, N, N] predicted adjacency (continuous).
-        target: [B, 1, N, N] or [B, N, N] target adjacency (binary).
-        threshold: Threshold for binarizing predictions.
-
-    Returns:
-        Accuracy as a scalar tensor.
-    """
-    preds = preds.squeeze(1) if preds.dim() == 4 else preds  # [B, N, N]
-    target = target.squeeze(1) if target.dim() == 4 else target  # [B, N, N]
-    preds_binary = (preds > threshold).float()
-    correct = preds_binary.eq(target).float().sum()
-    total = target.numel()
-    return correct / total
-
-
-def _compute_batch_auroc(preds: torch.Tensor, target: torch.Tensor, mask: torch.Tensor) -> float:
-    """
-    使用 sklearn 计算一批样本的 AUROC（逐样本 -> 再平均）。
-    约定输入均为 [B, 1, N, N]，仅统计下三角、去对角，且受 mask 限制。
-    """
-    # 统一到 [B, 1, N, N]
-    if preds.dim() == 3:
-        preds = preds.unsqueeze(1)
-    if target.dim() == 3:
-        target = target.unsqueeze(1)
-    if mask.dim() == 3:
-        mask = mask.unsqueeze(1)
-
-    B, _, N, _ = preds.shape
-    tril = torch.tril(torch.ones(N, N, device=preds.device, dtype=torch.bool), diagonal=-1)
-
-    aurocs = []
-    for i in range(B):
-        valid = (mask[i, 0] > 0.5) & tril
-        y_score = preds[i, 0][valid].detach().cpu().numpy()
-        y_true = (target[i, 0][valid] > 0.5).float().detach().cpu().numpy()
-        # 极端情形：全正或全负，返回 0.5 避免报错
-        if y_true.sum() == 0 or y_true.sum() == y_true.size:
-            aurocs.append(0.5)
-        else:
-            aurocs.append(float(roc_auc_score(y_true, y_score)))
-    return float(np.mean(aurocs)) if len(aurocs) > 0 else 0.0
+from evaluation.evaluations import compute_edge_metrics
 
 
 def _build_sde(config):
@@ -162,6 +116,137 @@ def _compute_joint_regularizer(
     return joint_loss
 
 
+def _build_decoder(config, device, workdir, train_ds, eval_ds, mode: str):
+    decoder = None
+    # 仅允许使用已训练好的 decoder
+    ts_feat = config.data.ts_features
+    if config.decoder.pretrained:
+        decoder_ckpt = config.decoder.ckpt
+        if decoder_ckpt and os.path.isfile(decoder_ckpt):
+            tmp = torch.load(decoder_ckpt, map_location=device)
+            decoder = RNNDecoder(
+                n_in_node=ts_feat,
+                msg_hid=config.decoder.msg_hidden,
+                msg_out=config.model.nf // 2,
+                n_hid=config.decoder.n_hidden,
+                do_prob=0.1,
+                sigma_init=0.1,
+            ).to(device)
+            state_dict = tmp.get("model_state_dict", tmp)
+            decoder.load_state_dict(state_dict)
+        else:
+            if mode == "train":
+                decoder = train_temporal_decoder(config, workdir, train_ds, eval_ds).to(device)
+                logging.info(f"Trained a new decoder from scratch, ts_feat={ts_feat}.")
+            elif mode == "eval":
+                logging.error("Pretrained decoder checkpoint not found.")
+            else:
+                logging.error("Invalid mode, should be train or eval.")
+            return
+    else:
+        logging.error("Evaluation requires a pretrained decoder, but none is provided.")
+        return
+    if decoder is None:
+        raise RuntimeError(
+            "Temporal decoder is required but not available. Please set "
+            "config.decoder.pretrained=True and provide a valid "
+            "config.decoder.ckpt for mode='%s'." % mode
+        )
+    return decoder
+
+
+DEFAULT_SAMPLING_EPS: float = 1e-3
+
+
+def _get_sampling_eps(config, default: float = DEFAULT_SAMPLING_EPS) -> float:
+    """
+    读取采样噪声步长 eps：
+    - 优先从 config.sampling.eps 获取；
+    - 否则退回默认值，不改变既有行为。
+    """
+    try:
+        return float(getattr(getattr(config, "sampling", object()), "eps", default))
+    except Exception:
+        return default
+
+
+def make_sampling_fn(
+    config,
+    sde,
+    inverse_scaler,
+    batch_size: int,
+    eps: Optional[float] = None,
+):
+    """
+    构造并返回固定 batch 形状的 sampling_fn。
+
+    参数
+    ----
+    config : Any
+        全局配置对象，需要 data.num_channels 与 data.max_node。
+    sde : Any
+        SDE 实例。
+    inverse_scaler : Callable
+        数据反归一化函数。
+    batch_size : int
+        采样时的 batch 大小。
+    eps : float, optional
+        采样 eps；若为 None 则从 config.sampling.eps 或默认值获取。
+
+    返回
+    ----
+    Callable
+        调用形式与原 sampling.get_sampling_fn 返回值一致。
+    """
+    eff_eps = _get_sampling_eps(config) if eps is None else eps
+    sampling_shape = (
+        batch_size,
+        config.data.num_channels,
+        config.data.max_node,
+        config.data.max_node,
+    )
+    return sampling.get_sampling_fn(config, sde, sampling_shape, inverse_scaler, eff_eps)
+
+
+def wait_and_restore(
+    ckpt_filename: str,
+    state: dict,
+    device,
+    *,
+    warn_once: bool = True,
+    retry_delays: tuple[int, ...] = (60, 60, 120),
+) -> dict:
+    """
+    等待 checkpoint 文件出现并带退避重试恢复状态。
+    - 等待阶段仅打印一次告警（可配置）。
+    - 恢复阶段失败将按 retry_delays 顺序延时重试。
+
+    返回
+    ----
+    dict
+        成功恢复后的 state。
+    """
+    waited = False
+    while not os.path.exists(ckpt_filename):
+        if warn_once and not waited:
+            logging.warning("Waiting for the arrival of %s", os.path.basename(ckpt_filename))
+            waited = True
+        time.sleep(retry_delays[0] if retry_delays else 60)
+
+    # 恢复并按需重试
+    try:
+        return restore_checkpoint(ckpt_filename, state, device=device)
+    except Exception:
+        for delay in retry_delays:
+            time.sleep(delay)
+            try:
+                return restore_checkpoint(ckpt_filename, state, device=device)
+            except Exception:
+                continue
+        # 最后一试：若仍失败，抛出原始异常以便定位
+        return restore_checkpoint(ckpt_filename, state, device=device)
+
+
 FLAGS = flags.FLAGS
 
 
@@ -179,6 +264,7 @@ def set_random_seed(config):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
+
 def sde_train_with_decoder(config, workdir):
     """
     两阶段训练管线：
@@ -186,8 +272,7 @@ def sde_train_with_decoder(config, workdir):
       2) 训练先验 score θ（常规 DSM/EDM），可选加入路线 C 的联合正则
       3) 评估/采样期支持路线 B 的似然引导
     """
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
+    device = config.device
     # 创建目录与日志
     sample_dir = os.path.join(workdir, "samples")
     os.makedirs(sample_dir, exist_ok=True)
@@ -201,11 +286,10 @@ def sde_train_with_decoder(config, workdir):
     eval_loader = DataLoader(eval_ds, batch_size=config.training.batch_size, shuffle=False)
     test_loader = DataLoader(test_ds, batch_size=config.training.batch_size, shuffle=False)
     n_node_pmf = torch.from_numpy(n_node_pmf).to(config.device)
-    # 归一化器与其逆（与 sde_train 保持一致）
+    # 归一化器与其逆
     scaler = datasets.get_data_scaler(config)
     inverse_scaler = datasets.get_data_inverse_scaler(config)
 
-    # 新增：统一构造 batch 的小工具，假设输入一定包含 adj/mask/ts
     def _make_batch(graphs: dict) -> dict:
         """
         规范化一个 batch，假设 graphs 包含 'adj'、'mask'、'ts' 三个键。
@@ -224,37 +308,8 @@ def sde_train_with_decoder(config, workdir):
     ema = ExponentialMovingAverage(score_model.parameters(), decay=config.model.ema_rate)
     optimizer = losses.get_optimizer(config, score_model.parameters())
 
-    # 1) 解码器：训练或加载
-    decoder = None
-    ts_feat = config.data.ts_features
-    if config.decoder.pretrained:
-        decoder_ckpt = config.decoder.ckpt
-        if decoder_ckpt and os.path.isfile(decoder_ckpt):
-            # 需按保存格式加载
-            tmp = torch.load(decoder_ckpt, map_location=device)
-            decoder = TemporalDecoder(
-                n_in_node=ts_feat,
-                msg_hid=config.model.nf,
-                msg_out=config.model.nf // 2,
-                n_hid=config.model.nf,
-                do_prob=0.1,
-                sigma_init=0.1,
-            ).to(device)
-            state_dict = tmp["model_state_dict"] if "model_state_dict" in tmp else tmp
-            decoder.load_state_dict(state_dict)
-            logging.info(f"Loaded a pretrained decoder from {decoder_ckpt}, ts_feat={ts_feat}.")
-        else:
-            decoder = train_temporal_decoder(config, workdir, train_ds, eval_ds).to(device)
-            logging.info(f"Trained a new decoder from scratch, ts_feat={ts_feat}.")
-    else:
-        decoder = TemporalDecoder(
-            n_in_node=ts_feat,
-            msg_hid=config.model.nf,
-            msg_out=config.model.nf // 2,
-            n_hid=config.model.nf,
-            do_prob=0.1,
-            sigma_init=0.1,
-        ).to(device)
+    # 1) 解码器：训练或加载（早失败保证 decoder 有效）
+    decoder = _build_decoder(config, device, workdir, train_ds, eval_ds, mode="train")
     decoder.eval()  # 训练 score 时固定 ψ
 
     # 构建 checkpoint 目录，与 evaluate 保持一致
@@ -275,11 +330,7 @@ def sde_train_with_decoder(config, workdir):
     reduce_mean = config.training.reduce_mean
     likelihood_weighting = config.training.likelihood_weighting
     loss_fn = losses.get_sde_loss_fn(
-        sde, 
-        train=True, 
-        reduce_mean=reduce_mean, 
-        continuous=continuous, 
-        likelihood_weighting=likelihood_weighting
+        sde, train=True, reduce_mean=reduce_mean, continuous=continuous, likelihood_weighting=likelihood_weighting
     )
     eval_step_fn = losses.get_step_fn(
         sde,
@@ -295,20 +346,18 @@ def sde_train_with_decoder(config, workdir):
     snapshot_freq_preempt = config.training.snapshot_freq_for_preemption
     eval_freq = config.training.eval_freq
 
-    # 可选：与 sde_train 一致的快照期采样
+    # 可选：与 sde_train 一致的快照期采样（复用 make_sampling_fn）
     if config.training.snapshot_sampling:
-        sampling_shape = (
-            config.training.eval_batch_size,
-            config.data.num_channels,
-            config.data.max_node,
-            config.data.max_node,
+        sampling_fn = make_sampling_fn(
+            config,
+            sde,
+            inverse_scaler,
+            batch_size=config.training.eval_batch_size,
         )
-        sampling_fn = sampling.get_sampling_fn(config, sde, sampling_shape, inverse_scaler, sampling_eps)
 
     train_iter = iter(train_loader)
     score_model.train()
     for step in range(initial_step, max_steps + 1):
-        # 取一批数据（与 sde_train 对齐）：仅处理 dict 输入，去除历史兼容逻辑
         try:
             graphs = next(train_iter)
         except StopIteration:
@@ -347,14 +396,17 @@ def sde_train_with_decoder(config, workdir):
             writer.add_scalar("train/loss_base", base_loss.item(), step)
             writer.add_scalar("train/loss_joint", joint_loss.item(), step)
             writer.add_scalar("train/loss_total", total_loss.item(), step)
-            logging.info("step: %d, loss_base: %.5e, loss_joint: %.5e, loss_total: %.5e" % (step, base_loss.item(), joint_loss.item(), total_loss.item()))
+            logging.info(
+                "step: %d, loss_base: %.5e, loss_joint: %.5e, loss_total: %.5e"
+                % (step, base_loss.item(), joint_loss.item(), total_loss.item())
+            )
 
         # 抢占式快照（与 sde_train 对齐）
         if step != 0 and step % snapshot_freq_preempt == 0:
             state["step"] = step
             save_checkpoint(checkpoint_meta, state)
 
-        # 周期评估（与 sde_train 对齐）：仅处理 dict 输入
+        # 周期评估：仅处理 dict 输入
         if step % eval_freq == 0:
             for eval_graphs in eval_loader:
                 eval_batch = _make_batch(eval_graphs)
@@ -367,7 +419,7 @@ def sde_train_with_decoder(config, workdir):
                 logging.info("step: %d, test_loss: %.5e" % (step, test_loss.item()))
                 writer.add_scalar("test_loss", test_loss.item(), step)
 
-        # 快照保存与可选采样（与 sde_train 对齐）
+        # 快照保存与可选采样
         if (step != 0 and step % snapshot_freq == 0) or step == max_steps:
             save_step = step // snapshot_freq if snapshot_freq > 0 else step
             save_checkpoint(
@@ -392,15 +444,27 @@ def sde_train_with_decoder(config, workdir):
             if config.training.snapshot_sampling:
                 ema.store(score_model.parameters())
                 ema.copy_to(score_model.parameters())
-                # 采样条件 ts（优先 eval_ds）
                 if config.data.temporal:
                     B = config.training.eval_batch_size
-                    idxs = np.random.choice(len(eval_ds) if len(eval_ds) > 0 else len(train_ds), B, replace=True)
-                    src_ds = eval_ds if len(eval_ds) > 0 else train_ds
-                    ts_cond = torch.stack([src_ds[i]["ts"] for i in idxs]).to(config.device)
+                    # 随机索引一批测试样本，配对构造条件与真值
+                    idxs = np.random.randint(len(eval_ds), size=B).tolist()
+                    ts_batch = torch.stack([eval_ds[i]["ts"] for i in idxs]).to(config.device)
+                    true_adj_batch = torch.stack([eval_ds[i]["adj"] for i in idxs]).to(config.device)
+                    mask_batch = torch.stack([eval_ds[i]["mask"] for i in idxs]).to(config.device)
                 else:
-                    ts_cond = None
-                _, _, _ = sampling_fn(score_model, n_node_pmf, ts=ts_cond)
+                    ts_batch = None
+                # 采样
+                pred_adj_batch, _, _ = sampling_fn(score_model, n_node_pmf, decoder, ts=ts_batch)
+                batch_results = compute_edge_metrics(pred_adj_batch, true_adj_batch, mask_batch)
+                logging.info(
+                    "step: %d, sample_eval_auroc: %.6f, sample_eval_aupr: %.6f, "
+                    "sample_eval_f1_best: %.6f, sample_eval_best_tau: %.6f",
+                    step,
+                    batch_results["auroc"],
+                    batch_results["aupr"],
+                    batch_results["f1_best"],
+                    batch_results["best_threshold"],
+                )
                 ema.restore(score_model.parameters())
 
     writer.close()
@@ -414,146 +478,118 @@ def sde_eval_with_decoder(config, workdir, eval_folder="eval"):
     - 使用 guided_pc_sampler 进行配对时序条件采样
     - 按 num_sampling_rounds 生成样本，计算邻接矩阵 AUROC 并做宏平均
     """
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = config.device
     eval_dir = os.path.join(workdir, eval_folder)
     os.makedirs(eval_dir, exist_ok=True)
 
     # 数据集与归一化
     train_ds, eval_ds, test_ds, n_node_pmf = datasets.get_dataset(config)
-    n_node_pmf = torch.from_numpy(n_node_pmf).to(config.device)
+    n_node_pmf = torch.from_numpy(n_node_pmf).to(device)
     scaler = datasets.get_data_scaler(config)
     inverse_scaler = datasets.get_data_inverse_scaler(config)
 
     # 模型与状态
-    score_model = mutils.create_model(config)
+    score_model = mutils.create_model(config).to(device)
     optimizer = losses.get_optimizer(config, score_model.parameters())
     ema = ExponentialMovingAverage(score_model.parameters(), decay=config.model.ema_rate)
     state = dict(optimizer=optimizer, model=score_model, ema=ema, step=0)
 
     checkpoint_dir = os.path.join(workdir, "checkpoints")
 
-    # SDE（与 backup 对齐）
-    sde_name = config.training.sde.lower()
-    if sde_name == "vpsde":
-        sde = sde_lib.VPSDE(
-            beta_min=config.model.beta_min,
-            beta_max=config.model.beta_max,
-            N=config.model.num_scales,
-        )
-        sampling_eps = 1e-3
-    elif sde_name == "subvpsde":
-        sde = sde_lib.subVPSDE(
-            beta_min=config.model.beta_min,
-            beta_max=config.model.beta_max,
-            N=config.model.num_scales,
-        )
-        sampling_eps = 1e-3
-    elif sde_name == "vesde":
-        sde = sde_lib.VESDE(
-            sigma_min=config.model.sigma_min,
-            sigma_max=config.model.sigma_max,
-            N=config.model.num_scales,
-        )
-        sampling_eps = 1e-5
-    else:
-        raise NotImplementedError(f"SDE {config.training.sde} unknown.")
+    # SDE
+    sde = _build_sde(config)
 
-    # 仅允许使用已训练好的 decoder
-    ts_feat = config.data.ts_features
-    if config.decoder.pretrained:
-        decoder_ckpt = config.decoder.ckpt
-        if decoder_ckpt and os.path.isfile(decoder_ckpt):
-            tmp = torch.load(decoder_ckpt, map_location=device)
-            decoder = TemporalDecoder(
-                n_in_node=ts_feat,
-                msg_hid=config.model.nf,
-                msg_out=config.model.nf // 2,
-                n_hid=config.model.nf,
-                do_prob=0.1,
-                sigma_init=0.1,
-            ).to(device)
-            state_dict = tmp.get("model_state_dict", tmp)
-            decoder.load_state_dict(state_dict)
-        else:
-            logging.error("Pretrained decoder checkpoint not found.")
-            return
-    else:
-        logging.error("Evaluation requires a pretrained decoder, but none is provided.")
-        return
+    # 仅允许使用已训练好的 decoder（早失败）
+    decoder = _build_decoder(config, device, workdir, train_ds, eval_ds, mode="eval")
     decoder.eval()
 
-    # 固定 batch 形状的采样函数
-    sampling_shape = (
-        config.eval.batch_size,
-        config.data.num_channels,
-        config.data.max_node,
-        config.data.max_node,
-    )
-    sampling_fn = sampling.get_sampling_fn(config, sde, sampling_shape, inverse_scaler, sampling_eps)
+    # 固定 batch 形状的采样函数（复用 make_sampling_fn，统一 eps）
+    sampling_fn = make_sampling_fn(config, sde, inverse_scaler, batch_size=config.eval.batch_size)
 
     begin_ckpt = config.eval.begin_ckpt
     logging.info("begin checkpoint: %d" % (begin_ckpt,))
 
+    # 遍历评估区间内的所有 checkpoint
     for ckpt in range(begin_ckpt, config.eval.end_ckpt + 1):
-        # 等待 checkpoint
-        waiting_message_printed = False
         ckpt_filename = os.path.join(checkpoint_dir, f"checkpoint_{ckpt}.pth")
-        while not os.path.exists(ckpt_filename):
-            if not waiting_message_printed:
-                logging.warning("Waiting for the arrival of checkpoint_%d" % (ckpt,))
-                waiting_message_printed = True
-            time.sleep(60)
-        # 恢复状态（含重试）
-        try:
-            state = restore_checkpoint(ckpt_filename, state, device=config.device)
-        except Exception:
-            time.sleep(60)
-            try:
-                state = restore_checkpoint(ckpt_filename, state, device=config.device)
-            except Exception:
-                time.sleep(120)
-                state = restore_checkpoint(ckpt_filename, state, device=config.device)
+        # 等待并恢复该 checkpoint（文件可能尚未写完或未到位，带退避重试）
+        state = wait_and_restore(ckpt_filename, state, device=config.device)
 
+        # 将 EMA 权重拷贝到当前模型参数，用于更稳定的推理
         ema.copy_to(score_model.parameters())
 
-        # 采用 num_sampling_rounds 策略，宏平均 AUROC
+        # 采用“总样本数 num_samples，按 batch B 分多轮采样”的策略进行宏平均
         B = config.eval.batch_size
         num_samples = int(config.eval.num_samples)
         num_rounds = int(np.ceil(num_samples / B))
-        total_auc_sum, counted = 0.0, 0
+
+        # 累积各指标的加权和（按本轮实际使用样本数 use 加权），最后再除以总计数 counted 得到宏平均
+        sum_auroc, sum_aupr, sum_f1, sum_tau = 0.0, 0.0, 0.0, 0.0
+        counted = 0
 
         for r in range(num_rounds):
-            # 随机索引一批测试样本，配对构造条件与真值
+            # 随机索引一批测试样本，构造条件（ts）与真值（adj/mask）
             idxs = np.random.randint(len(test_ds), size=B).tolist()
-            ts_batch = (
-                torch.stack([test_ds[i]["ts"] for i in idxs]).to(config.device)
-                if config.data.temporal
-                else None
-            )
-            ts_batch = ts_batch.permute(0, 2, 1, 3).contiguous() if ts_batch is not None else None  # [B,N,T,C] -> [B,T,N,C]
+            ts_batch = torch.stack([test_ds[i]["ts"] for i in idxs]).to(config.device) if config.data.temporal else None
             true_adj_batch = torch.stack([test_ds[i]["adj"] for i in idxs]).to(config.device)
             mask_batch = torch.stack([test_ds[i]["mask"] for i in idxs]).to(config.device)
 
-            # 采样与评估
+            # 使用解码器条件（ts）进行采样，得到预测的邻接矩阵
             pred_adj_batch, _, _ = sampling_fn(score_model, n_node_pmf, decoder, ts=ts_batch)
-            batch_auc = _compute_batch_auroc(pred_adj_batch, true_adj_batch, mask_batch)
 
-            # 将最后一轮裁剪到 num_samples
+            # 控制本轮参与评估的样本数量，避免超过总需求 num_samples
             remain = num_samples - counted
             use = min(remain, B)
-            total_auc_sum += batch_auc * use
+
+            # 计算本轮的边级别指标（AUC-ROC、AUC-PR、F1@bestτ），先按 use 截断再评估
+            results = compute_edge_metrics(
+                preds=pred_adj_batch[:use],
+                target=true_adj_batch[:use],
+                mask=mask_batch[:use],
+            )
+
+            # 兼容 tensor/float，提取标量
+            auroc = float(results["auroc"]) if hasattr(results["auroc"], "item") else results["auroc"]
+            aupr = float(results["aupr"]) if hasattr(results["aupr"], "item") else results["aupr"]
+            f1b = float(results["f1_best"]) if hasattr(results["f1_best"], "item") else results["f1_best"]
+            tau = (
+                float(results["best_threshold"])
+                if hasattr(results["best_threshold"], "item")
+                else results["best_threshold"]
+            )
+
+            # 加权累积（按 use 权重），为最终宏平均做准备
+            sum_auroc += auroc * use
+            sum_aupr += aupr * use
+            sum_f1 += f1b * use
+            sum_tau += tau * use
             counted += use
+
+            # 若已满足目标样本量则提前结束
             if counted >= num_samples:
                 break
 
-        final_auc = total_auc_sum / max(counted, 1)
-        logging.info("ckpt: %d, mean_auroc: %.6f" % (ckpt, final_auc))
+        # 计算最终的宏平均指标（避免除零）
+        final_auroc = sum_auroc / max(counted, 1)
+        final_aupr = sum_aupr / max(counted, 1)
+        final_f1 = sum_f1 / max(counted, 1)
+        final_tau = sum_tau / max(counted, 1)
+
+        # 记录当前 checkpoint 的评估结果
+        logging.info(
+            "ckpt: %d, mean_auroc: %.6f, mean_aupr: %.6f, "
+            "mean_f1_best: %.6f, mean_best_tau: %.6f",
+            ckpt,
+            final_auroc,
+            final_aupr,
+            final_f1,
+            final_tau,
+        )
 
 
 run_train_dict = {"sde_with_decoder": sde_train_with_decoder, "sde": sde_train}
 
 run_eval_dict = {"sde": sde_evaluate, "sde_with_decoder": sde_eval_with_decoder}
-
 
 
 def train(config, workdir):
