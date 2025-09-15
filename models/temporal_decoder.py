@@ -92,6 +92,10 @@ class TemporalDecoder(nn.Module):
         self.hidden_r = nn.Linear(n_hid, n_hid, bias=False)
         self.hidden_i = nn.Linear(n_hid, n_hid, bias=False)
         self.hidden_h = nn.Linear(n_hid, n_hid, bias=False)
+        
+        self.msg_r = nn.Linear(self.n_hid, self.n_hid, bias=False)
+        self.msg_i = nn.Linear(self.n_hid, self.n_hid, bias=False)
+        self.msg_n = nn.Linear(self.n_hid, self.n_hid, bias=False)
 
         # 输出 MLP（基于隐状态），预测输入的增量
         self.out_fc1 = nn.Linear(n_hid, n_hid)
@@ -104,17 +108,20 @@ class TemporalDecoder(nn.Module):
 
         print("Using learned GraphGDP temporal decoder (RNN-style).")
 
-    def project_adjacency(self, A: torch.Tensor) -> torch.Tensor:
-        """确保 A 对称且零对角，并限制到 [0, 1]，保持梯度流动。"""
-        A_sym = (A + A.transpose(-2, -1)) / 2
-        A_sym = A_sym - torch.diag_embed(
-            torch.diagonal(A_sym, dim1=-2, dim2=-1)
-        )
-        return torch.clamp(A_sym, 0, 1)
+    def project_adjacency(self, A: torch.Tensor, temp: float = 1.0, eps: float = 1e-6) -> torch.Tensor:
+        # 对称
+        A = 0.5 * (A + A.transpose(-2, -1))
+        # 将实数映射到 (0,1)，比 clamp 更可微；temp 可调节边界陡峭度
+        A = torch.sigmoid(A / temp)
+        # 零对角（掩码乘法，保持计算图）
+        I = torch.eye(A.size(-1), device=A.device).unsqueeze(0).expand_as(A)
+        A = A * (1.0 - I)
+        # 行归一化，避免度数放大
+        deg = A.sum(dim=-1, keepdim=True) + eps
+        A = A / deg
+        return A
 
-    def _message_passing(
-        self, hidden: torch.Tensor, A: torch.Tensor
-    ) -> torch.Tensor:
+    def _message_passing(self, hidden: torch.Tensor, A: torch.Tensor) -> torch.Tensor:
         """
         在隐藏状态上执行一次消息传递并聚合到接收节点。
 
@@ -131,19 +138,19 @@ class TemporalDecoder(nn.Module):
             [B, N, H]，聚合后的消息。
         """
         B, N, H = hidden.shape
-        senders_h = hidden.unsqueeze(2).expand(-1, -1, N, -1)   # [B,N,N,H]
-        receivers_h = hidden.unsqueeze(1).expand(-1, N, -1, -1) # [B,N,N,H]
-        pre_msg = torch.cat([senders_h, receivers_h], dim=-1)   # [B,N,N,2H]
+        senders_h = hidden.unsqueeze(2).expand(-1, -1, N, -1)  # [B,N,N,H]
+        receivers_h = hidden.unsqueeze(1).expand(-1, N, -1, -1)  # [B,N,N,H]
+        pre_msg = torch.cat([senders_h, receivers_h], dim=-1)  # [B,N,N,2H]
 
         msg = torch.tanh(self.msg_fc1(pre_msg))
         msg = F.dropout(msg, p=self.dropout_prob, training=self.training)
-        msg = torch.tanh(self.msg_fc2(msg))                     # [B,N,N,H]
+        msg = torch.tanh(self.msg_fc2(msg))  # [B,N,N,H]
 
-        edge_w = A.unsqueeze(-1)                                # [B,N,N,1]
-        weighted = msg * edge_w                                 # [B,N,N,H]
+        edge_w = A.unsqueeze(-1)  # [B,N,N,1]
+        weighted = msg * edge_w  # [B,N,N,H]
 
         # 聚合到接收节点（与旧实现一致：对 senders 维求和）
-        agg = weighted.sum(dim=1)                               # [B,N,H]
+        agg = weighted.sum(dim=1)  # [B,N,H]
         return agg
 
     def single_step_forward(
@@ -167,27 +174,25 @@ class TemporalDecoder(nn.Module):
         Tuple[torch.Tensor, torch.Tensor]
             (pred, hidden_new)，分别为 [B,N,D] 与 [B,N,H]。
         """
-        agg = self._message_passing(hidden, A)                  # [B,N,H]
+        agg = self._message_passing(hidden, A)  # [B,N,H]
 
-        r = torch.sigmoid(self.input_r(x_t) + self.hidden_r(agg))
-        i = torch.sigmoid(self.input_i(x_t) + self.hidden_i(agg))
-        n = torch.tanh(self.input_n(x_t) + r * self.hidden_h(agg))
-        hidden_new = (1 - i) * n + i * hidden                   # [B,N,H]
+        r = torch.sigmoid(self.input_r(x_t) + self.hidden_r(hidden)+ self.msg_r(agg))
+        i = torch.sigmoid(self.input_i(x_t) + self.hidden_i(hidden)+ self.msg_i(agg))
+        n = torch.tanh(self.input_n(x_t) + r * self.hidden_h(hidden)+ self.msg_n(agg))
+        hidden_new = (1 - i) * n + i * hidden  # [B,N,H]
 
         # 基于隐藏状态生成对 x_t 的残差预测
-        pred = F.dropout(F.relu(self.out_fc1(hidden_new)),
-                         p=self.dropout_prob, training=self.training)
-        pred = F.dropout(F.relu(self.out_fc2(pred)),
-                         p=self.dropout_prob, training=self.training)
-        pred = self.out_fc3(pred)                               # [B,N,D]
-        pred = x_t + pred                                       # 残差
+        pred = F.dropout(F.relu(self.out_fc1(hidden_new)), p=self.dropout_prob, training=self.training)
+        pred = F.dropout(F.relu(self.out_fc2(pred)), p=self.dropout_prob, training=self.training)
+        pred = self.out_fc3(pred)  # [B,N,D]
+        pred = x_t + pred  # 残差
         return pred, hidden_new
 
     def forward(
         self,
         A: torch.Tensor,
         X: torch.Tensor,
-        pred_steps: int = 1,          # 兼容保留；此实现总是逐步 teacher forcing
+        pred_steps: int = 1,  # 兼容保留；此实现总是逐步 teacher forcing
         return_loglik: bool = True,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """
@@ -212,7 +217,7 @@ class TemporalDecoder(nn.Module):
         """
         B, T, N, D = X.shape
         A = self.project_adjacency(A)
-        
+
         assert A.size(-1) == X.size(2)
 
         # 初始化隐藏状态
@@ -222,20 +227,19 @@ class TemporalDecoder(nn.Module):
         total_loglik = torch.tensor(0.0, device=X.device) if return_loglik else None
 
         for t in range(T - 1):
-            x_t = X[:, t]                                      # [B,N,D]
+            x_t = X[:, t]  # [B,N,D]
             pred_t, hidden = self.single_step_forward(x_t, hidden, A)
             preds.append(pred_t)
 
             if return_loglik:
                 target = X[:, t + 1]
-                sigma = torch.exp(self.log_sigma)
-                # 高斯负对数似然：向量化以稳定数值
-                mse = ((target - pred_t) ** 2).sum()
-                const = N * D * B * torch.log(sigma * (2 * torch.pi) ** 0.5)
-                neg_loglik = mse / (2 * sigma**2) + const
-                total_loglik = total_loglik - neg_loglik
+                sigma = torch.exp(self.log_sigma).clamp(min=1e-4, max=10.0)
+                diff2 = (target - pred_t).pow(2).sum()
+                count = B * N * D
+                nll_t = 0.5 * count * torch.log(2 * torch.pi * sigma * sigma) + diff2 / (2 * sigma * sigma)
+                total_loglik = total_loglik - nll_t
 
-        X_pred = torch.stack(preds, dim=1)                     # [B,T-1,N,D]
+        X_pred = torch.stack(preds, dim=1)  # [B,T-1,N,D]
         if return_loglik:
             return X_pred, total_loglik
         return X_pred, None
@@ -260,8 +264,6 @@ class TemporalDecoder(nn.Module):
             A = A.requires_grad_()
         _, loglik = self.forward(A, X, return_loglik=True)
         if loglik is not None:
-            grad = torch.autograd.grad(
-                outputs=loglik, inputs=A, retain_graph=False, create_graph=False
-            )[0]
+            grad = torch.autograd.grad(outputs=loglik, inputs=A, retain_graph=False, create_graph=False)[0]
             return grad
         return torch.zeros_like(A)
