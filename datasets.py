@@ -9,7 +9,7 @@ from torch_geometric.utils import from_networkx, degree, to_networkx
 
 
 class NRISpringsDataset(Dataset):
-    def __init__(self, root, suffix="_springs", n_balls=10, pool="mean"):
+    def __init__(self, root, suffix="_springs", n_balls=10, delta_t=20):
         """
         NRI 弹簧数据集读取器。
 
@@ -26,6 +26,7 @@ class NRISpringsDataset(Dataset):
         """
         super().__init__()
         suffix += str(n_balls)
+        suffix += "_" + str(delta_t)
 
         def _load(name):
             path = os.path.join(root, f"{name}.npy")
@@ -33,13 +34,12 @@ class NRISpringsDataset(Dataset):
                 raise FileNotFoundError(path)
             return np.load(path)
 
-        feat = _load(f"feat{suffix}")  # [S, N, T, C]
+        feat = _load(f"feat{suffix}")  # [S, T, N, C]
         edges = _load(f"edges{suffix}")  # [S, N, N]
-        self.S, self.N, self.T, self.C = feat.shape
+        self.S, self.T, self.N, self.C = feat.shape
         self.edges = edges.astype(np.float32)
         self.feat = feat
-        self.pool = pool
-        self.L = feat.shape[2]
+        self.L = feat.shape[1]  # time length
 
     class _Subset(Dataset):
         """
@@ -85,14 +85,14 @@ class NRISpringsDataset(Dataset):
         A = self.edges[i]  # [N,N]
         A = (A + A.T) / 2.0
         A = np.clip(A, 0, 1)
-        X = self.feat[i]  # [N,L,C]
-        ts = X  # [N,L,C]
+        X = self.feat[i]  # [L,N,C]
+        ts = X  # [L,N,C]
         adj = torch.from_numpy(A[None, ...])  # [1,N,N]
         # 将对角置零，避免自环；保持上下三角可用于模型前向
         mask = torch.ones_like(adj)
         eye = torch.eye(self.N, dtype=adj.dtype, device=adj.device)
         mask = mask - eye[None, ...]
-        ts = torch.from_numpy(ts.astype(np.float32))  # [N,L,C]
+        ts = torch.from_numpy(ts.astype(np.float32))  # [L,N,C]
         return {"adj": adj, "mask": mask, "ts": ts, "n": self.N}
 
     def n_node_pmf(self):
@@ -204,8 +204,9 @@ def get_dataset(config):
     )
 
     # 在 get_dataset 中加分支：
-    if getattr(config.data, "temporal", False) or config.data.name.lower() == "nri_springs10":
-        dataset = NRISpringsDataset(config.data.root, "_springs", n_balls=config.data.max_node)
+    if config.data.temporal:
+        dataset = NRISpringsDataset(config.data.root, suffix=config.data.name, n_balls=config.data.max_node, delta_t=config.data.delta_t)
+        print(f"Loaded NRISpringsDataset from {config.data.root},suffix {config.data.name}, with {len(dataset)} samples, each has {dataset.N} nodes, {dataset.T} time steps, and {dataset.C} features per node.")
         num_train = int(len(dataset) * config.data.split_ratio)
         num_test = len(dataset) - num_train
         train_ds = dataset[:num_train]  # 现已返回子数据集视图
