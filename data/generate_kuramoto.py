@@ -52,9 +52,9 @@ def generate_dataset(num_nodes, num_sims, length, sample_freq):
 
     sim_data_all = []
     edges_all = []
+    edges = generate_edges(num_nodes, args.p, args.k)
     for i in range(num_sims):
         # Sample edges
-        edges = generate_edges(num_nodes, args.p, args.k, exp_id=i)
 
         print(f"Simulating training trajectory:{i+1:3d}  /{num_sims:3d}")
         t = time.time()
@@ -84,11 +84,13 @@ if __name__ == "__main__":
         print("Generating data for experiment {}".format(exp_id))
         print("Generating {} simulations".format(args.num_all))
         data_all, edges_all = generate_dataset(n, args.num_all, args.length, args.sample_freq)
-        print("Data shape:", data_all.shape)
-        print("Edges shape:", edges_all.shape)
-        # output data has shape [batch, nodes, time, variables]
+        # Reshape to [num_sims, num_timesteps, num_nodes, variables]
+        data_all = data_all.transpose(0, 2, 1, 3)  # [num_sims, num_nodes, num_timesteps]
+        print("Final data shape: ", data_all.shape)
+        print("Final edges shape: ", edges_all.shape)
+        # output data has shape [batch, time, nodes, variables]
         # save feat.npy and edges.npy
-        np.save("feat" + suffix + "_exp" + str(exp_id) + ".npy", data_all)
-        np.save("edges" + suffix + "_exp" + str(exp_id) + ".npy", edges_all)
+        np.save("feat" + suffix + ".npy", data_all)
+        np.save("edges" + suffix + ".npy", edges_all)
 
-        print("Experiment {} finished".format(exp_id))
+        print("Experiment {exp_id} finished, saved to feat{suffix}.npy and edges{suffix}.npy".format(exp_id=exp_id, suffix=suffix))
