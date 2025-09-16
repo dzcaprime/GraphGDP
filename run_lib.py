@@ -138,6 +138,7 @@ def _build_decoder(config, device, workdir, train_ds, eval_ds, mode: str):
             if mode == "train":
                 decoder = train_temporal_decoder(config, workdir, train_ds, eval_ds).to(device)
                 logging.info(f"Trained a new decoder from scratch, ts_feat={ts_feat}.")
+                return decoder
             elif mode == "eval":
                 logging.error("Pretrained decoder checkpoint not found.")
             else:

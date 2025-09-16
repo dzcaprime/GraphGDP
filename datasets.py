@@ -206,7 +206,7 @@ def get_dataset(config):
     # 在 get_dataset 中加分支：
     if config.data.temporal:
         dataset = NRISpringsDataset(config.data.root, suffix=config.data.name, n_balls=config.data.max_node, delta_t=config.data.delta_t)
-        print(f"Loaded NRISpringsDataset from {config.data.root},suffix {config.data.name}, with {len(dataset)} samples, each has {dataset.N} nodes, {dataset.T} time steps, and {dataset.C} features per node.")
+        print(f"Loaded Dataset from {config.data.root},suffix {config.data.name}, with {len(dataset)} samples, each has {dataset.N} nodes, {dataset.T} time steps, and {dataset.C} features per node.")
         num_train = int(len(dataset) * config.data.split_ratio)
         num_test = len(dataset) - num_train
         train_ds = dataset[:num_train]  # 现已返回子数据集视图

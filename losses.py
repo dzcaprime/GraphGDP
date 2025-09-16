@@ -68,7 +68,8 @@ def get_sde_loss_fn(sde, train, reduce_mean=True, continuous=True, likelihood_we
         Returns:
             loss: A scalar that represents the average loss value across the mini-batch.
         """
-        adj, mask = batch
+        # adj, mask, _ = batch
+        adj, mask, _ = batch['adj'], batch['mask'], batch['ts']
         score_fn = mutils.get_score_fn(sde, model, train=train, continuous=continuous)
         t = torch.rand(adj.shape[0], device=adj.device) * (sde.T - eps) + eps
 
