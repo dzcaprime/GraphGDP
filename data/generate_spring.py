@@ -180,6 +180,7 @@ if __name__ == "__main__":
     sim = SpringSim(noise_var=0.0, n_balls=args.n_balls)
     suffix = "_springs"
     suffix += str(args.n_balls)
+    suffix += "_" + str(args.sample_freq)
     np.random.seed(args.seed)
     print("Generating {} data with {} balls.".format(args.simulation, args.n_balls))
     t = time.time()
@@ -201,6 +202,10 @@ if __name__ == "__main__":
     loc_all = loc_all.transpose(0, 3, 1, 2)
     vel_all = vel_all.transpose(0, 3, 1, 2)
     feat_all = np.concatenate([loc_all, vel_all], axis=3)
+    # Reshape to [num_sims, num_timesteps, num_atoms, num_dims*2]
+    feat_all = feat_all.transpose(0, 2, 1, 3)
+    print("Final data shape: ", feat_all.shape)
+    print("Final edges shape: ", edges_all.shape)
 
     # save feat.npy and edges.npy
     np.save("feat" + suffix + ".npy", feat_all)
