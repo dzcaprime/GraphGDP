@@ -9,7 +9,7 @@ from torch_geometric.utils import from_networkx, degree, to_networkx
 
 
 class NRISpringsDataset(Dataset):
-    def __init__(self, root, suffix="_springs", n_balls=10, delta_t=20):
+    def __init__(self, root, suffix="_springs", n_balls=10, delta_t=None):
         """
         NRI 弹簧数据集读取器。
 
@@ -26,7 +26,8 @@ class NRISpringsDataset(Dataset):
         """
         super().__init__()
         suffix += str(n_balls)
-        suffix += "_" + str(delta_t)
+        if delta_t is not None:
+            suffix += "_" + str(delta_t)
 
         def _load(name):
             path = os.path.join(root, f"{name}.npy")
@@ -194,6 +195,14 @@ def get_dataset(config):
     """
     创建训练/评估/测试数据集与节点数分布。
     保持原有切分语义不变，避免破坏用户空间。
+
+    归一化策略
+    --------
+    - 仅当 config.data.temporal 为 True 且 suffix 不为 "_springs"、
+      "_Kuramoto" 时启用。
+    - 参照 baseline/utils.load_data：使用训练集的 min/max（在 S、T、N
+      维度上聚合，逐通道 C）将全量数据缩放至 [-1, 1]。
+    - 对常量通道采用稳健分母，避免除零。
     """
     # define data transforms
     transform = T.Compose(
@@ -205,10 +214,39 @@ def get_dataset(config):
 
     # 在 get_dataset 中加分支：
     if config.data.temporal:
-        dataset = NRISpringsDataset(config.data.root, suffix=config.data.name, n_balls=config.data.max_node, delta_t=config.data.delta_t)
-        print(f"Loaded Dataset from {config.data.root},suffix {config.data.name}, with {len(dataset)} samples, each has {dataset.N} nodes, {dataset.T} time steps, and {dataset.C} features per node.")
+        dataset = NRISpringsDataset(
+            config.data.root,
+            suffix=config.data.name,
+            n_balls=config.data.max_node,
+            delta_t=config.data.delta_t,
+        )
+        print(
+            f"Loaded Dataset from {config.data.root},suffix {config.data.name}, "
+            f"with {len(dataset)} samples, each has {dataset.N} nodes, "
+            f"{dataset.T} time steps, and {dataset.C} features per node."
+        )
         num_train = int(len(dataset) * config.data.split_ratio)
         num_test = len(dataset) - num_train
+
+        # 新增：当 suffix 不是 "_springs" 或 "_Kuramoto" 时，进行归一化
+        # 参考 baseline/utils.load_data 的按通道 min-max 到 [-1,1]
+        if config.data.name not in ("_springs", "_Kuramoto"):
+            # feat 形状 [S, T, N, C]；按训练集样本的 S 维做统计
+            feat = dataset.feat  # np.ndarray
+            if isinstance(feat, np.ndarray) and feat.ndim == 4:
+                # 训练集统计：在 (S_train, T, N) 聚合，逐通道 C
+                tr = feat[:num_train]
+                x_min = tr.min(axis=(0, 1, 2), keepdims=True)
+                x_max = tr.max(axis=(0, 1, 2), keepdims=True)
+                denom = x_max - x_min
+                # 稳健化，避免除零（常量通道）
+                denom[denom < 1e-12] = 1.0
+                # 就地归一化，影响 train/eval/test 共享的父数据
+                feat -= x_min
+                feat *= (2.0 / denom)
+                feat -= 1.0
+
+        # 保持原有切分与返回结构
         train_ds = dataset[:num_train]  # 现已返回子数据集视图
         eval_ds = dataset[:num_test]
         test_ds = dataset[num_train:]
