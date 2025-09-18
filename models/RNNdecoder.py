@@ -1,3 +1,4 @@
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -144,31 +145,36 @@ class RNNDecoder(nn.Module):
     def compute_likelihood_gradient(self, A: torch.Tensor, X: torch.Tensor) -> torch.Tensor:
         """
         为 CG 引导取梯度：对“已投影”的 A 取 ∇_A loglik，避免把投影的非线性夹进链式。
+        在外层可能处于 torch.no_grad() 的情况下，局部强制开启梯度图。
         """
         # <<< 固定投影，不让梯度穿过投影
         with torch.no_grad():
             A_clean = self.project_adjacency(A)
 
-        A_var = A_clean.clone().detach().requires_grad_(True)
+        # 在局部作用域强制开启梯度记录，避免外层 no_grad 影响
+        with torch.enable_grad():
+            A_var = A_clean.clone().detach().requires_grad_(True)
 
-        # 复用 forward 主体，但不要再次投影：直接走单步循环体
-        N = A.size(-1)
-        B, T, N_x, D = X.shape
-        assert N_x == N
+            # 复用 forward 主体，但不要再次投影：直接走单步循环体
+            N = A.size(-1)
+            B, T, N_x, D = X.shape
+            assert N_x == N
 
-        hidden = torch.zeros(B, N, self.n_hid, device=X.device, dtype=X.dtype)
+            hidden = torch.zeros(B, N, self.n_hid, device=X.device, dtype=X.dtype)
 
-        total_loglik = torch.tensor(0.0, device=X.device, dtype=X.dtype)
-        for t in range(T - 1):
-            x_t = X[:, t]
-            pred_t, hidden = self.single_step_forward(x_t, hidden, A_var)
-            target = X[:, t + 1]
-            sigma = torch.exp(self.log_sigma).clamp(min=1e-4, max=10.0)
-            diff2 = (target - pred_t).pow(2).sum()
-            count = B * N * D
-            const = 0.5 * count * torch.log(torch.tensor(2*math.pi, dtype=X.dtype, device=X.device) * sigma * sigma)
-            nll_t = const + diff2 / (2 * sigma * sigma)
-            total_loglik = total_loglik - nll_t
+            total_loglik = torch.tensor(0.0, device=X.device, dtype=X.dtype)
+            for t in range(T - 1):
+                x_t = X[:, t]
+                pred_t, hidden = self.single_step_forward(x_t, hidden, A_var)
+                target = X[:, t + 1]
+                sigma = torch.exp(self.log_sigma).clamp(min=1e-4, max=10.0)
+                # 每步：均值误差，去掉常数项（对 A 的梯度为 0）
+                diff2 = (target - pred_t).pow(2).mean()  # 原来是 sum()
+                sigma = torch.exp(self.log_sigma).clamp(min=1e-4, max=10.0)
+                nll_t = diff2 / (2 * sigma * sigma)
+                total_loglik = total_loglik - nll_t
 
-        grad = torch.autograd.grad(total_loglik, A_var, retain_graph=False, create_graph=False)[0]
-        return grad
+            grad = torch.autograd.grad(total_loglik, A_var, retain_graph=False, create_graph=False)[0]
+            if grad is None:
+                grad = torch.zeros_like(A_var)
+            return grad
