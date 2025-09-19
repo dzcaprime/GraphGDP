@@ -4,6 +4,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Tuple, Optional
 
+
 class RNNDecoder(nn.Module):
     """
     时序解码器（自回归版，支持 burn-in）：
@@ -141,8 +142,8 @@ class RNNDecoder(nn.Module):
             grad = torch.autograd.grad(loglik, A, retain_graph=False, create_graph=False)[0]
             return grad
         return torch.zeros_like(A)
-    
-    def compute_likelihood_gradient(self, A: torch.Tensor, X: torch.Tensor) -> torch.Tensor:
+
+    def compute_log_likelihood_backup(self, A: torch.Tensor, X: torch.Tensor) -> torch.Tensor:
         """
         为 CG 引导取梯度：对“已投影”的 A 取 ∇_A loglik，避免把投影的非线性夹进链式。
         在外层可能处于 torch.no_grad() 的情况下，局部强制开启梯度图。
@@ -178,3 +179,55 @@ class RNNDecoder(nn.Module):
             if grad is None:
                 grad = torch.zeros_like(A_var)
             return grad
+
+    def compute_log_likelihood(
+        self,
+        A: torch.Tensor,
+        X: torch.Tensor,
+        *,
+        allow_grad_through_projection: bool = True,
+        reduce: str = "sum",  # "sum" | "mean"（对时间步求和/取平均）
+        use_dropout: bool = False
+    ) -> torch.Tensor:
+        """
+        返回每个样本的 log-likelihood（不做 autograd.grad），供外部对 A_t 求梯度：
+            grad = torch.autograd.grad(loglik.sum(), A_t)[0]
+
+        参数：
+          allow_grad_through_projection: True 则投影可导，梯度可回传至 A_t；
+                                         False 则投影处切断梯度（更稳但方向可能偏）。
+          reduce:  "sum" 对时间步累计；"mean" 对时间步做平均（影响梯度尺度）。
+          use_dropout: 计算似然时是否启用 dropout（默认关闭以稳定梯度）。
+        返回：
+          loglik: 形状 [B] 的张量（每个样本一个标量对数似然）
+        """
+        assert reduce in ("sum", "mean")
+        if not use_dropout:
+            self.eval()  # 关闭 dropout / BN 的训练行为
+        # --- 投影（可选是否允许梯度穿过） ---
+        if allow_grad_through_projection:
+            A_in = self.project_adjacency(A)  # 可导：梯度可回传到 A
+        else:
+            with torch.no_grad():
+                A_clean = self.project_adjacency(A)  # 不可导
+            A_in = A_clean.detach()  # 切断梯度
+        B, T, N, D = X.shape
+        hidden = torch.zeros(B, N, self.n_hid, device=X.device, dtype=X.dtype)
+        # 注意：只保留与 A 相关的项（去掉对 A 的梯度为 0 的常数）
+        sigma = torch.exp(self.log_sigma).clamp(min=1e-4, max=10.0)
+        denom = 2.0 * sigma * sigma
+        # 按样本累计对数似然
+        total_loglik = torch.zeros(B, device=X.device, dtype=X.dtype)
+        for t in range(T - 1):
+            x_t = X[:, t]  # teacher forcing
+            pred_t, hidden = self.single_step_forward(x_t, hidden, A_in)
+            target = X[:, t + 1]
+            # 仅使用 (target - pred)^2 / (2 sigma^2)，丢弃常数项
+            # 逐样本聚合，避免提前对 batch 求和
+            # diff2_per_sample: [B]
+            diff2 = (target - pred_t).pow(2).view(B, -1).sum(dim=1)
+            nll_t = diff2 / denom
+            total_loglik = total_loglik - nll_t  # loglik = -nll
+        if reduce == "mean":
+            total_loglik = total_loglik / (T - 1)
+        return total_loglik  # [B]
