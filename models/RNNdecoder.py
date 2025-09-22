@@ -57,13 +57,16 @@ class RNNDecoder(nn.Module):
 
         print("Using autoregressive GraphGDP temporal decoder (RNN-style).")
 
-    def project_adjacency(self, A: torch.Tensor, temp: float = 1.0, eps: float = 1e-6):
+    def project_adjacency(self, A: torch.Tensor, temp: float = 1.0, eps: float = 1e-6, row_normalize: bool = True) -> torch.Tensor:
         A = 0.5 * (A + A.transpose(-2, -1))
         A = torch.sigmoid(A / temp)
         I = torch.eye(A.size(-1), device=A.device).unsqueeze(0).expand_as(A)
         A = A * (1.0 - I)
         deg = A.sum(dim=-1, keepdim=True) + eps
-        return A / deg
+        if row_normalize:
+            deg = A.sum(dim=-1, keepdim=True) + eps
+            A= A / deg
+        return A
 
     def _message_passing(self, hidden: torch.Tensor, A: torch.Tensor) -> torch.Tensor:
         B, N, H = hidden.shape
@@ -187,7 +190,8 @@ class RNNDecoder(nn.Module):
         *,
         allow_grad_through_projection: bool = True,
         reduce: str = "sum",  # "sum" | "mean"（对时间步求和/取平均）
-        use_dropout: bool = False
+        use_dropout: bool = False,
+        row_normalize: bool = True,
     ) -> torch.Tensor:
         """
         返回每个样本的 log-likelihood（不做 autograd.grad），供外部对 A_t 求梯度：
@@ -198,36 +202,44 @@ class RNNDecoder(nn.Module):
                                          False 则投影处切断梯度（更稳但方向可能偏）。
           reduce:  "sum" 对时间步累计；"mean" 对时间步做平均（影响梯度尺度）。
           use_dropout: 计算似然时是否启用 dropout（默认关闭以稳定梯度）。
-        返回：
-          loglik: 形状 [B] 的张量（每个样本一个标量对数似然）
+
+        观测模型（逐节点逐维独立的高斯）：
+          X_{t+1} | A, X_{≤t} ~ N( μ_t(A), σ^2 I )
+          log p(X|A) = const - Σ_t ||X_{t+1} - μ_t||^2 / (2σ^2)
+        本实现仅保留与 A 有关的项（去掉常数），从而：
+          loglik = - Σ_t ||target - pred||^2 / (2σ^2)
         """
         assert reduce in ("sum", "mean")
         if not use_dropout:
-            self.eval()  # 关闭 dropout / BN 的训练行为
+            self.eval()  # 关闭 dropout / BN 的训练行为（稳定梯度）
         # --- 投影（可选是否允许梯度穿过） ---
+        # 作用：对称化、sigmoid 映射到 (0,1)、零对角、按行归一化（可选），
+        #      使 A 成为稳定的加权邻接矩阵。若不允许梯度穿过，可避免将投影的非线性夹在链式法则中。
         if allow_grad_through_projection:
-            A_in = self.project_adjacency(A)  # 可导：梯度可回传到 A
+            A_in = self.project_adjacency(A, row_normalize=row_normalize)  # 可导：梯度可回传到 A
         else:
             with torch.no_grad():
-                A_clean = self.project_adjacency(A)  # 不可导
+                A_clean = self.project_adjacency(A, row_normalize=row_normalize)  # 不可导
             A_in = A_clean.detach()  # 切断梯度
+
         B, T, N, D = X.shape
         hidden = torch.zeros(B, N, self.n_hid, device=X.device, dtype=X.dtype)
-        # 注意：只保留与 A 相关的项（去掉对 A 的梯度为 0 的常数）
+
+        # 高斯似然的简化：仅保留 -||y-μ||^2/(2σ^2)，常数和 log σ 项被丢弃（对 A 的梯度为 0）
         sigma = torch.exp(self.log_sigma).clamp(min=1e-4, max=10.0)
         denom = 2.0 * sigma * sigma
-        # 按样本累计对数似然
+
         total_loglik = torch.zeros(B, device=X.device, dtype=X.dtype)
         for t in range(T - 1):
             x_t = X[:, t]  # teacher forcing
             pred_t, hidden = self.single_step_forward(x_t, hidden, A_in)
             target = X[:, t + 1]
-            # 仅使用 (target - pred)^2 / (2 sigma^2)，丢弃常数项
-            # 逐样本聚合，避免提前对 batch 求和
-            # diff2_per_sample: [B]
-            diff2 = (target - pred_t).pow(2).view(B, -1).sum(dim=1)
+            # 逐样本聚合，避免过早在 batch 维上求和，便于外层对样本加权等
+            diff2 = (target - pred_t).pow(2).view(B, -1).sum(dim=1)  # [B]
             nll_t = diff2 / denom
             total_loglik = total_loglik - nll_t  # loglik = -nll
+
+        # reduce="mean" 仅改变尺度（类似学习率缩放），不改变梯度方向
         if reduce == "mean":
             total_loglik = total_loglik / (T - 1)
         return total_loglik  # [B]

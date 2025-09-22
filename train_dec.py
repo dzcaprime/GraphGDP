@@ -14,36 +14,70 @@ from models.temporal_decoder import TemporalDecoder
 from models.RNNdecoder import RNNDecoder
 
 
-def _normalize_batch(batch: Dict[str, torch.Tensor], device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
+def _normalize_batch(
+    batch: Dict[str, Tensor], device: torch.device
+) -> Tuple[Tensor, Tensor, Tensor]:
     """
-    标准化批数据到稳定契约：
-    - A: [B, N, N]
-    - X: [B, T, N, C]
-    仅支持 dataset 约定键：'adj'、'ts'。
+    标准化批数据，消除所有 special cases：
+      - A: 邻接矩阵，强制 [B,N,N]
+      - X: 时序特征，强制 [B,T,N,C]
+      - mask_adj: 邻接掩码，强制 [B,N,N]
+
+    Parameters
+    ----------
+    batch : dict
+        包含键 'adj'、'mask'、'ts'。
+    device : torch.device
+        目标设备。
+
+    Returns
+    -------
+    A : Tensor
+        邻接矩阵，形状 [B,N,N]。
+    X : Tensor
+        时序张量，形状 [B,T,N,C]。
+    mask_adj : Tensor
+        邻接掩码，形状 [B,N,N]。
     """
-    A = batch["adj"].to(device=device, dtype=torch.float32)  # [B,N,N]
-    X = batch["ts"].to(device)  # [B,T,N,C]
-    A = A.squeeze(1) if A.dim() == 4 and A.size(1) == 1 else A  # [B,1,N,N] -> [B,N,N]
-    return A, X
+    A = batch["adj"].to(device=device, dtype=torch.float32)  # [B,1,N,N] 或 [B,N,N]
+    if A.dim() == 4 and A.size(1) == 1:
+        A = A.squeeze(1)  # [B,N,N]
+
+    X = batch["ts"].to(device=device, dtype=torch.float32)  # [B,T,N,C]
+
+    mask_adj = batch["mask"].to(device=device, dtype=torch.float32)  # [B,1,N,N] 或 [B,N,N]
+    if mask_adj.dim() == 4 and mask_adj.size(1) == 1:
+        mask_adj = mask_adj.squeeze(1)  # [B,N,N]
+
+    return A, X, mask_adj
 
 
-def _add_sde_noise(A: torch.Tensor, sde, device, eps: float = 1e-5):
+def _add_sde_noise(
+    A: Tensor,
+    sde,
+    device: torch.device,
+    mask_adj: Optional[Tensor] = None,
+    eps: float = 1e-5,
+) -> Tuple[Tensor, Tensor]:
     """
-    对邻接矩阵 A 加扩散噪声，生成 A_t。
-    - 随机采样 t ∈ [eps, sde.T]
-    - 按 SDE 前向公式生成 A_t
+    对邻接矩阵 A 引入噪声，返回 (A_t, t)。
+    mask_adj: 如果给定，按 [B,N,N] 层面屏蔽掉对角与已知边。
     """
-    B = A.shape[0]
+    B, N, _ = A.shape
+    # 采样 t
     t = torch.rand(B, device=device) * (sde.T - eps) + eps  # [B]
+    # 对称化高斯噪声
     z = torch.randn_like(A)
-    # 对称化噪声
-    z = torch.tril(z, -1)
-    z = z + z.transpose(-1, -2)
-    mean, std = sde.marginal_prob(A, t)
-    # 对称化mean
-    mean = torch.tril(mean, -1)
-    mean = mean + mean.transpose(-1, -2)
-    A_t = mean + std.view(-1, 1, 1) * z
+    z = torch.tril(z, -1); z = z + z.transpose(-1, -2)
+
+    mean, std = sde.marginal_prob(A, t)  # mean/std 形状 [B,N,N]
+    mean = torch.tril(mean, -1); mean = mean + mean.transpose(-1, -2)
+
+    if mask_adj is not None:
+        mean = mean * mask_adj
+        z = z * mask_adj
+
+    A_t = mean + std.view(-1,1,1) * z
     return A_t, t
 
 
@@ -65,11 +99,11 @@ def _train_one_epoch(
 
     for step, batch in enumerate(loader):
         optimizer.zero_grad(set_to_none=True)
-        A, X = _normalize_batch(batch, device)  # A:[B,N,N], X:[B,T,N,C]
+        A, X, mask = _normalize_batch(batch, device)  # A:[B,N,N], X:[B,T,N,C]
         B, T, N, C = X.shape
 
         # 对邻接加噪声
-        A_t, t = _add_sde_noise(A, sde, device)
+        A_t, t = _add_sde_noise(A, sde, device, mask)
 
         # 期望 decoder(A_t, X, return_loglik=True) 返回 (pred, loglik)
         pred, loglik = decoder(A_t, X, return_loglik=True, burn_in=False, burn_in_steps=5)
@@ -107,11 +141,11 @@ def _eval_one_epoch(decoder: RNNDecoder, loader: DataLoader, device: torch.devic
     loss_eval, mse_eval = [], []
 
     for batch in loader:
-        A, X = _normalize_batch(batch, device)
+        A, X, mask = _normalize_batch(batch, device)
         B, T, N, C = X.shape
 
         # 对邻接加噪声
-        A_t, t = _add_sde_noise(A, sde, device)
+        A_t, t = _add_sde_noise(A, sde, device, mask)
 
         pred, loglik = decoder(A_t, X, return_loglik=True, burn_in=False, burn_in_steps=5)
         if loglik is None:
