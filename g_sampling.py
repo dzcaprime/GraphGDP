@@ -5,43 +5,124 @@ import functools
 import torch
 
 from models import utils as mutils
-from sampling import shared_predictor_update_fn, shared_corrector_update_fn
-from sampling import ReverseDiffusionPredictor
 
 
 def likelihood_guided_score(
-    A_t, t, sde, model, decoder, mask: torch.Tensor, X_obs: torch.Tensor, guidance_weight: float = 2.0
+    A_t,
+    t,
+    sde,
+    model,
+    decoder,
+    mask: torch.Tensor,
+    X_obs: torch.Tensor,
+    guidance_weight: float = 1.0,
+    # --- single-switch controls ---
+    strategy: str = "cagrad",  # ["pcgrad", "cagrad"]
+    # scaling & alignment
+    row_normalize: bool = False,
+    snr_power: float = 0.5,     # SNR^snr_power scheduling (monotone ↑ as noise ↓)
+    w_cap: float = 1.0,         # cap for CAGrad-style optimal weight
+    eps: float = 1e-12,
 ):
-    assert A_t.dim() in (3, 4), f"A_t dim must be 3 or 4, got {A_t.shape}"
-    assert mask.dim() in (3, 4), f"mask dim must be 3 or 4, got {mask.shape}"
-    assert A_t.shape[-2:] == mask.shape[-2:], f"A_t/mask shape mismatch: {A_t.shape} vs {mask.shape}"
+    """Guided score with A0-space gradient + mapping to At + PCGrad/CAGrad + SNR schedule.
 
+    Args:
+        A_t: [B,1,N,N] or [B,N,N] current adjacency sample at time t.
+        t:  [B] vector of time steps.
+        strategy: "pcgrad" projects away the opposing component of likelihood grad
+                  when it conflicts with the score (Yu et al., NeurIPS'20); "cagrad"
+                  chooses an optimal non-negative scalar *w* (clipped by w_cap) that
+                  minimizes || s + w g ||^2, giving a conflict-averse merge.
+        snr_power: exponent for SNR scheduling; larger means stronger late-time guidance.
+    Returns:
+        guided_score: tensor shaped like score(A_t,t), i.e., [B,1,N,N].
+    """
+    # 记号：
+    # - sθ(A_t,t) ≈ ∇_{A_t} log p_t(A_t)（模型的得分）
+    # - 似然项 L(A0) = log p(X|A0)，我们先估计 A0（Tweedie 近似），再对 A0 求梯度
+    # - 再用链式法则映回 A_t 空间
+    assert A_t.dim() in (3, 4)
+    assert mask.dim() in (3, 4)
+    assert A_t.shape[-2:] == mask.shape[-2:]
+
+    # 0) base score: sθ(A_t,t)
+    # 目标是合成 sθ 与 ∇_{A_t} L 的方向，避免冲突并进行强度调度
     score_fn = mutils.get_score_fn(sde, model, train=False, continuous=True)
     with torch.no_grad():
         score_orig = score_fn(A_t, t, mask=mask)  # [B,1,N,N]
     if guidance_weight <= 0.0 or decoder is None or X_obs is None:
         return score_orig
 
-    # 2) 似然梯度在 3D 空间计算（A、mask 皆为 3D）
-    A_3d = A_t.squeeze(1) if A_t.dim() == 4 else A_t  # [B,N,N]
-    mask_3d = mask.squeeze(1) if mask.dim() == 4 else mask  # [B,N,N]
+    # 1) Tweedie 近似反演到 A0：
+    # 在 VPSDE/VESDE 类模型中，marginal_prob(0,t) 给出 (m_t, σ_t)。
+    # 经验式（Tweedie）：A0_hat ≈ (A_t + σ_t^2 sθ(A_t,t)) / m_t
+    # 因此 dA0/dA_t = 1/m_t（常数 w.r.t. A_t），便于后续链式法则。
+    A_4d = A_t if A_t.dim() == 4 else A_t.unsqueeze(1)  # [B,1,N,N]
+    mean, std = sde.marginal_prob(torch.zeros_like(A_4d), t)
+    if mean.dim() == 1:
+        mean = mean.view(-1, 1, 1, 1)
+    if std.dim() == 1:
+        std = std.view(-1, 1, 1, 1)
 
+    with torch.no_grad():
+        A0_hat = (A_4d + (std ** 2) * score_orig) / (mean + eps)  # [B,1,N,N]
+    A0_in = A0_hat.squeeze(1)  # [B,N,N]
+
+    # 计算 ∇_{A0} log p(X|A0)
+    # 注意：对称化与去对角保证图结构约束（无自环）；掩码保证只在有效边上生效。
     with torch.enable_grad():
-        A_3d = A_3d.clone().detach().requires_grad_(True)
-        logp = decoder.compute_log_likelihood(A_3d, X_obs)  # X_obs 支持 [B,T,N,F]
-        grad = torch.autograd.grad(logp.sum(), A_3d, allow_unused=False)[0]  # [B,N,N]
+        A0_in_req = A0_in.clone().detach().requires_grad_(True)
+        # logp(A0) = log p(X|A0)；对 batch 求和，便于一次求梯度
+        logp = decoder.compute_log_likelihood(A0_in_req, X_obs, row_normalize=row_normalize)
+        grad_A0 = torch.autograd.grad(logp.sum(), A0_in_req, allow_unused=False)[0]
 
-    # 3) 对称化 / 去对角 / 掩码（使用 3D 掩码）
-    grad = 0.5 * (grad + grad.transpose(-1, -2))
-    grad = grad - torch.diag_embed(torch.diagonal(grad, dim1=-2, dim2=-1))
-    grad = grad * mask_3d  # [B,N,N]
+    # 2) 结构规整：symmetrize + zero-diag + mask
+    M3 = mask.squeeze(1) if mask.dim() == 4 else mask
+    grad_A0 = 0.5 * (grad_A0 + grad_A0.transpose(-1, -2))
+    grad_A0 = grad_A0 - torch.diag_embed(torch.diagonal(grad_A0, dim1=-2, dim2=-1))
+    grad_A0 = grad_A0 * M3  # [B,N,N]
 
-    # 4) sigma_t 广播到 [B,1,1]，在 3D guidance 上施加，然后升到 4D 与 score 相加
-    _, sigma_t = sde.marginal_prob(torch.zeros_like(A_3d), t)  # [B]
-    sigma_t = sigma_t.view(-1, 1, 1)  # [B,1,1]
-    guidance_3d = guidance_weight * sigma_t * grad  # [B,N,N]
-    guided_score = score_orig + guidance_3d.unsqueeze(1)  # [B,1,N,N]
+    # 3) 链式法则映回 A_t 空间：∇_{A_t}L = ∇_{A0}L · (dA0/dA_t) = ∇_{A0}L / m_t
+    inv_mean = (1.0 / (mean + eps)).squeeze(1)  # [B,1,1]
+    grad_At = grad_A0 * inv_mean  # broadcast over N,N
 
+    # 4) 计算冲突度量与范数
+    s3d = score_orig.squeeze(1) * M3
+    g3d = grad_At * M3
+
+    dot = (s3d * g3d).sum(dim=(-2, -1), keepdim=True)          # [B,1,1]
+    s_norm2 = (s3d * s3d).sum(dim=(-2, -1), keepdim=True) + eps
+    g_norm2 = (g3d * g3d).sum(dim=(-2, -1), keepdim=True) + eps
+
+    if strategy.lower() == "pcgrad":
+        # PCGrad（投影法）：若 s·g < 0，则把 g 的反向分量去掉：
+        # g ← g - proj_s(g) = g - ( (g·s)/||s||^2 ) s
+        proj = (dot / s_norm2) * s3d  # component of g along s
+        conflict = (dot < 0.0)
+        g3d = torch.where(conflict, g3d - proj, g3d)
+    elif strategy.lower() == "cagrad":
+        # CAGrad（标量加权）：w* = argmin_{w≥0} || s + w g ||^2 = clamp( - (s·g)/||g||^2, [0, w_cap] )
+        w_opt = (-dot / g_norm2).clamp(min=0.0, max=w_cap)  # [B,1,1]
+        g3d = w_opt * g3d
+    else:
+        raise ValueError(f"Unknown strategy: {strategy}")
+
+    # 5) SNR 调度：snr = (m_t/σ_t)^2；schedule = ( snr / (1+snr) )^p ∈ [0,1)
+    # 动机：噪声小（后期）时提高观测似然的权重，前期避免过强引导。
+    snr = (mean / (std + eps)) ** 2  # [B,1,1,1]
+    schedule = (snr / (1.0 + snr)).pow(snr_power).squeeze(1)  # [B,1,1]
+
+    # 6) 引导项：Δs = -λ · schedule · σ_t · g
+    # - 负号让梯度朝提升 log p(X|A0) 的方向（最大化似然）
+    # - 乘 σ_t 以与原有 score 的量纲对齐（经验做法）
+    _, sigma_t = sde.marginal_prob(torch.zeros_like(A0_in), t)
+    sigma_t = sigma_t.view(-1, 1, 1)
+    guidance_3d = - guidance_weight * schedule * sigma_t * g3d  # [B,N,N]
+
+    guided_score = score_orig + guidance_3d.unsqueeze(1)
+
+    # 数值稳定：清理 NaN/Inf
+    guided_score = torch.nan_to_num(guided_score, nan=0.0, posinf=0.0, neginf=0.0)
     return guided_score
 
 
@@ -166,6 +247,10 @@ def get_guided_pc_sampler(
     guidance_weight=1.0,
 ):
     """Create a guided PC sampler with improved error handling and logging."""
+    import sampling
+    from sampling import shared_predictor_update_fn, shared_corrector_update_fn
+    from sampling import ReverseDiffusionPredictor
+
     predictor_update_fn = functools.partial(
         shared_predictor_update_fn,
         sde=sde,
