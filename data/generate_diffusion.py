@@ -6,10 +6,9 @@ import networkx as nx
 import argparse
 import pickle
 
-
 parser = argparse.ArgumentParser('Generate diffusion equation data')
 parser.add_argument('--graph', type=str, default='ER')
-parser.add_argument('--num-nodes', type=int, default=50,
+parser.add_argument('--num-nodes', type=int, default=10,
                     help='Number of nodes in the simulation.')
 parser.add_argument('--p', type=float, default=0.1, 
                     help='Connection/add connection probability In ER/NWS')
@@ -26,17 +25,48 @@ parser.add_argument('--te_num', type=int, default=30,
                     help='Number of test trajectories.')
 
 parser.add_argument('--steps', type=int, default=200, help='simulation times steps')
-parser.add_argument('--step_size', type=int, default=0.1, help = 'simulation step size')
+# 将 step_size 类型修正为 float，保持默认值与用法一致
+parser.add_argument('--step_size', type=float, default=0.1, help = 'simulation step size')
 parser.add_argument('--beta', type=float, default=1.0, help='diffusion constant')
+
+# 新增：Kuramoto 风格保存参数
+parser.add_argument('--save_kuramoto_style', action='store_true',
+                    help='If set, save results like generate_kuramoto.py: '
+                         'feat_Diffusion{N}.npy [B,T,N,1] and edges_Diffusion{N}.npy [B,N,N]. '
+                         'Uses a single graph per experiment and stacks it B times.')
+parser.add_argument('--num_all', type=int, default=10000,
+                    help='Total number of trajectories (B) to generate when --save_kuramoto_style '
+                         'is set. Default 10000 to match Kuramoto script.')
 args = parser.parse_args()
 
 
-def field(x,t):
+def field(x, t):
+    """
+    Compute dx/dt = beta * L @ x.
+
+    Why
+    ---
+    Keep diffusion dynamics intact; only I/O and saving paths are modified.
+    L and beta are bound from outer scope to avoid passing through ODE solver.
+    """
     dxdt = beta*L@x
     return dxdt  
 
 # solve the ODE with an ODE solver
 def simulation(t):
+    """
+    Run one diffusion simulation for a random initial condition.
+
+    Parameters
+    ----------
+    t : np.ndarray
+        Time grid of shape [T].
+
+    Returns
+    -------
+    np.ndarray
+        Trajectory with shape [T, N, 1].
+    """
     x0 = np.random.random(size=n)
     x = odeint(field,x0,t)
     x = np.expand_dims(x, axis = -1) 
@@ -59,11 +89,12 @@ if __name__ == '__main__':
         k = args.k
         beta = args.beta
         np.random.seed(exp_id)
-        if args.graph in 'ER':
+        # 明确等号判断，行为不变但更清晰
+        if args.graph == 'ER':
             G = nx.erdos_renyi_graph(n,p,seed=exp_id)
-        elif args.graph in 'NWS':
+        elif args.graph == 'NWS':
             G = nx.newman_watts_strogatz_graph(n,k,p,seed=exp_id)
-        elif args.graph in 'BA':
+        elif args.graph == 'BA':
             G = nx.barabasi_albert_graph(n,k,seed=exp_id)
 
         # get laplacian
@@ -74,6 +105,28 @@ if __name__ == '__main__':
         L = - D@A@D
 
         t = np.linspace(0, (args.steps - 1)* args.step_size, num=args.steps)
+
+        # 新增：当选择 Kuramoto 风格保存时，按同一张图生成并堆叠 B 条轨迹
+        if args.save_kuramoto_style:
+            B = int(args.num_all)
+            sim_data_all = []
+            for i in range(B):
+                if (i % 100) == 0:
+                    print(f"Simulating trajectory: {i+1:6d}/{B:6d}")
+                sim_data_all.append(simulation(t))
+            data_all = np.array(sim_data_all, dtype=np.float32)  # [B, T, N, 1]
+            edges_all = np.repeat(A[None, ...], B, axis=0)      # [B, N, N]
+
+            suffix = "_Diffusion" + str(n)
+            print("Final data shape: ", data_all.shape)
+            print("Final edges shape: ", edges_all.shape)
+            np.save("feat" + suffix + ".npy", data_all)
+            np.save("edges" + suffix + ".npy", edges_all)
+            print("Experiment {exp_id} finished, saved to feat{suffix}.npy and edges{suffix}.npy"
+                  .format(exp_id=exp_id, suffix=suffix))
+            continue  # 不执行旧的 pickle 保存路径
+
+        # 保持原有行为：生成 tr/va/te 并保存为 pickle（兼容旧用户）
         x_tr = np.zeros((args.tr_num,args.steps, n ,1))
         for i in range(args.tr_num):
             print(f'Simulating train trajectory: {i+1:3d}/{args.tr_num:3d}')
