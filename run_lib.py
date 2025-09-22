@@ -54,71 +54,126 @@ def _project_adjacency(A: torch.Tensor, mask: Optional[torch.Tensor] = None):
     return A.unsqueeze(1)
 
 
-@torch.no_grad()
 def _tweedie_denoise(sde, A_t, t, score, eps=1e-8):
     # A_t, score: [B,1,N,N]; t: [B] 或标量
-    mean, std = sde.marginal_prob(torch.zeros_like(A_t), t)
-    if mean.dim() == 1:
-        mean = mean.view(-1, 1, 1, 1)
-    if std.dim() == 1:
-        std = std.view(-1, 1, 1, 1)
+    mean, std = sde.marginal_prob(A_t, t)
+    B = A_t.size(0)
+    if mean.shape != A_t.shape:
+        mean = mean.expand_as(A_t)
+    if std.shape != A_t.shape:
+        std = std.view(B, 1, 1, 1).expand_as(A_t)
     return (A_t + (std**2) * score) / (mean + eps)
 
 
-def _compute_joint_regularizer(
+def _compute_alignment_loss(
     decoder: nn.Module,
     sde,
     model: nn.Module,
     batch: dict,
-    guidance_weight: float = 1.0,
+    *,
+    align_weight: float = 0.0,
+    t_cut_ratio: float = 0.05,
+    normalize: bool = True,
     eps: float = 1e-8,
     continuous: bool = True,
-):
+) -> torch.Tensor:
     """
-    路线 C：对当前去噪估计 A0_hat 施加 -λ log pψ(X|A0_hat) 正则，不回传穿过 decoder。
-    返回标量 joint_loss（已乘以 guidance_weight）。
-    需要 batch 至少包含：
-      - 'adj': [B,1,N,N] 真图 A0
-      - 'mask': [B,1,N,N] 掩码
-      - 'ts': 观测时序，传给 decoder
+    稳定版“对齐损失”：在小噪声区间让 score 对齐 decoder 的似然梯度。
+
+    设计动机
+    -------
+    - 在 t→0 的区域，score 与 ∇A_t log p(X|A_t) 存在近似关系。
+    - 用 Tweedie 去噪 + 解码器似然梯度估计，构造与 score 同量纲的目标向量场。
+    - 仅作数值引导，避免穿过 decoder 回传，稳定且与推理时的引导语义一致。
+
+    参数
+    ----
+    decoder : nn.Module
+        预训练解码器，仅用于前向与梯度估计。
+    sde, model : Any
+        SDE 与 score 模型。
+    batch : dict
+        至少包含 'adj'、'mask'、'ts'，形状与现有训练一致。
+    align_weight : float
+        对齐损失权重；0 关闭。
+    t_cut_ratio : float
+        小 t 采样区间上限占比，默认 5%。
+    normalize : bool
+        是否单位化两个向量场，缓解尺度不匹配。
+    continuous, eps : 见上文。
+
+    返回
+    ----
+    torch.Tensor
+        标量损失（已乘以 align_weight）。
     """
-    if decoder is None or guidance_weight <= 0.0:
+    if decoder is None or align_weight <= 0.0:
         return torch.tensor(0.0, device=batch["adj"].device)
 
     A0 = batch["adj"]  # [B,1,N,N]
     mask = batch.get("mask", torch.ones_like(A0))
+    if mask.dim() == 3:
+        mask = mask.unsqueeze(1)  # 保证为 [B,1,N,N]
     ts = batch.get("ts", None)
-
-    # 采样一个随机 t，构造 A_t 并通过 score 得到 A0_hat
     B = A0.size(0)
     device = A0.device
-    t = torch.rand(B, device=device) * (sde.T - 1e-5) + 1e-5  # (0, T]
+
+    # 1) 小 t 区间随机采样
+    t_cut = max(1e-5, float(t_cut_ratio) * float(sde.T))
+    t = torch.rand(B, device=device) * (t_cut - 1e-5) + 1e-5  # [B]
     z = torch.randn_like(A0)
-    mean, std = sde.marginal_prob(torch.zeros_like(A0), t)
-    if mean.dim() == 1:
-        mean = mean.view(-1, 1, 1, 1)
-    if std.dim() == 1:
-        std = std.view(-1, 1, 1, 1)
-    A_t = mean * A0 + std * z
-
+    mean, std = sde.marginal_prob(A0, t)  # [B] or [B,1,1,1]
+    if mean.shape != A0.shape:
+        mean = mean.expand_as(A0)
+    if std.shape != A0.shape:
+        std = std.view(B, 1, 1, 1).expand_as(A0)
+    # 2) 构造 A_t 并计算 score
+    A_t = mean + std * z
+    A_t.requires_grad_(True)
     score_fn = mutils.get_score_fn(sde, model, train=True, continuous=continuous)
-    with torch.no_grad():
-        score = score_fn(A_t, t, mask=mask, ts=ts)
-        A0_hat = _tweedie_denoise(sde, A_t, t, score)
-        A0_hat = _project_adjacency(A0_hat, mask=mask).squeeze(1)  # [B,N,N]
+    score = score_fn(A_t, t, mask=mask)  # [B,1,N,N]
 
-    # 只对 A0_hat 的副本求 decoder 前向，取 loglik，作为数值正则
-    decoder.eval()
-    pred, loglik = decoder(A0_hat.detach(), ts, return_loglik=True)
-    if loglik is None:
-        return torch.tensor(0.0, device=device)
-    joint_loss = -guidance_weight * loglik.mean()
-    return joint_loss
+    # 3) Tweedie 去噪得到 A0_hat（复用工具函数，减少重复）
+    A0_hat = _tweedie_denoise(sde, A_t, t, score, eps=eps)  # [B,1,N,N]
+
+    # 4) 用解码器估计似然梯度（对对称零对角投影后的 A）
+    A0_in = A0_hat.squeeze(1)  # [B,N,N]
+    try:
+        g_dec = decoder.compute_likelihood_gradient_backup(A0_in, ts)  # [B,N,N]
+    except Exception as e:
+        logging.warning("alignment gradient failed: %s", str(e))
+        g_dec = torch.zeros_like(A0_in)
+    # 5) 结构与掩码一致性
+    g_dec = 0.5 * (g_dec + g_dec.transpose(-1, -2))
+    g_dec = g_dec - torch.diag_embed(torch.diagonal(g_dec, dim1=-2, dim2=-1))
+    g_dec = g_dec * mask.squeeze(1)
+
+    # 6) 拉回 A_t 空间：∇_{At} ≈ (1/mean) ∇_{A0}
+    g_up = g_dec.unsqueeze(1) / (mean + eps)  # [B,1,N,N]
+
+    # 7) 可选单位化，避免尺度不匹配
+    if normalize:
+
+        def _unit(x: torch.Tensor, m: torch.Tensor) -> torch.Tensor:
+            flat = (x * m).reshape(x.size(0), -1)
+            n = flat.norm(dim=1, keepdim=True) + eps
+            return x / n.view(-1, 1, 1, 1)
+
+        score_used = _unit(score, mask)
+        g_used = _unit(g_up, mask)
+    else:
+        score_used, g_used = score, g_up
+
+    # 8) MSE 对齐（仅在有效边域内）
+    diff = (score_used - g_used) * mask
+    assert mask.shape == g_up.shape, f"mask shape {mask.shape}, g_up shape {g_up.shape}"
+    assert diff.shape == mask.shape, f"diff shape {diff.shape}, mask shape {mask.shape}"
+    mse = (diff.pow(2).sum(dim=(1, 2, 3)) / (mask.sum(dim=(1, 2, 3)) + eps)).mean()
+    return align_weight * mse
 
 
 def _build_decoder(config, device, workdir, train_ds, eval_ds, mode: str):
     decoder = None
-    # 仅允许使用已训练好的 decoder
     ts_feat = config.data.ts_features
     if config.decoder.pretrained:
         decoder_ckpt = config.decoder.ckpt
@@ -136,7 +191,9 @@ def _build_decoder(config, device, workdir, train_ds, eval_ds, mode: str):
             decoder.load_state_dict(state_dict)
         else:
             if mode == "train":
-                decoder = train_temporal_decoder(config, workdir, train_ds, eval_ds).to(device)
+                # —— 构造 SDE 实例，传入解码器训练 —— #
+                sde = _build_sde(config)
+                decoder = train_temporal_decoder(config, workdir, train_ds, eval_ds, sde=sde).to(device)
                 logging.info(f"Trained a new decoder from scratch, ts_feat={ts_feat}.")
                 return decoder
             elif mode == "eval":
@@ -312,6 +369,9 @@ def sde_train_with_decoder(config, workdir):
     # 1) 解码器：训练或加载（早失败保证 decoder 有效）
     decoder = _build_decoder(config, device, workdir, train_ds, eval_ds, mode="train")
     decoder.eval()  # 训练 score 时固定 ψ
+    # 冻结解码器参数，避免训练期间被更新
+    for p in decoder.parameters():
+        p.requires_grad_(False)
 
     # 构建 checkpoint 目录，与 evaluate 保持一致
     checkpoint_dir = os.path.join(workdir, "checkpoints")
@@ -341,6 +401,14 @@ def sde_train_with_decoder(config, workdir):
         continuous=continuous,
         likelihood_weighting=likelihood_weighting,
     )
+    # 读取对齐与联合正则的配置（一次性解析，减少循环内开销）
+    pg_cfg = getattr(getattr(config, "training", object()), "posterior_guidance", None)
+    align_w = float(getattr(pg_cfg, "align_weight", 0.0)) if pg_cfg else 0.0
+    t_cut_ratio = float(getattr(pg_cfg, "t_cut_ratio", 0.05)) if pg_cfg else 0.05
+    align_norm = bool(getattr(pg_cfg, "align_normalize", True)) if pg_cfg else True
+    warmup_steps = int(getattr(pg_cfg, "align_warmup_steps", 1000)) if pg_cfg else 1000
+    joint_w = float(getattr(pg_cfg, "joint_weight", 0.0)) if pg_cfg else 0.0
+
     max_steps = config.training.n_iters
     log_freq = config.training.log_freq
     snapshot_freq = config.training.snapshot_freq
@@ -370,22 +438,23 @@ def sde_train_with_decoder(config, workdir):
         optimizer.zero_grad(set_to_none=True)
         base_loss = loss_fn(score_model, batch)
 
-        # 路线 C：联合正则（不回传穿过 decoder）
-        joint_w = getattr(getattr(config, "training", object()), "posterior_guidance", object())
-        joint_w = getattr(joint_w, "joint_weight", 0.0)
-        if joint_w > 0.0 and isinstance(batch, dict):
-            joint_loss = _compute_joint_regularizer(
+        # 新增：稳定版对齐损失（小 t 对齐似然梯度）
+        if align_w > 0.0:
+            warm = min(1.0, (step + 1) / max(1, warmup_steps))
+            align_loss = _compute_alignment_loss(
                 decoder=decoder,
                 sde=sde,
                 model=score_model,
                 batch=batch,
-                guidance_weight=joint_w,
+                align_weight=align_w * warm,
+                t_cut_ratio=t_cut_ratio,
+                normalize=align_norm,
                 continuous=True,
             )
         else:
-            joint_loss = torch.tensor(0.0, device=device)
+            align_loss = torch.tensor(0.0, device=device)
 
-        total_loss = base_loss + joint_loss
+        total_loss = base_loss + align_loss
         total_loss.backward()
         if config.optim.grad_clip > 0:
             torch.nn.utils.clip_grad_norm_(score_model.parameters(), config.optim.grad_clip)
@@ -395,11 +464,14 @@ def sde_train_with_decoder(config, workdir):
         # logging
         if step % log_freq == 0:
             writer.add_scalar("train/loss_base", base_loss.item(), step)
-            writer.add_scalar("train/loss_joint", joint_loss.item(), step)
+            writer.add_scalar("train/loss_align", align_loss.item(), step)
             writer.add_scalar("train/loss_total", total_loss.item(), step)
             logging.info(
-                "step: %d, loss_base: %.5e, loss_joint: %.5e, loss_total: %.5e"
-                % (step, base_loss.item(), joint_loss.item(), total_loss.item())
+                "step: %d, loss_base: %.5e, loss_align: %.5e, loss_total: %.5e",
+                step,
+                base_loss.item(),
+                align_loss.item(),
+                total_loss.item(),
             )
 
         # 抢占式快照（与 sde_train 对齐）
@@ -578,8 +650,7 @@ def sde_eval_with_decoder(config, workdir, eval_folder="eval"):
 
         # 记录当前 checkpoint 的评估结果
         logging.info(
-            "ckpt: %d, mean_auroc: %.6f, mean_aupr: %.6f, "
-            "mean_f1_best: %.6f, mean_best_tau: %.6f",
+            "ckpt: %d, mean_auroc: %.6f, mean_aupr: %.6f, " "mean_f1_best: %.6f, mean_best_tau: %.6f",
             ckpt,
             final_auroc,
             final_aupr,
