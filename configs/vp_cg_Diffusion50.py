@@ -11,10 +11,11 @@ def get_config():
 
     # ==============Decoder=============
     config.decoder = decoder = ml_collections.ConfigDict()
-    decoder.ckpt = None  # 若指定则加载该 ckpt 的解码器
+    # decoder.ckpt = None  # 若指定则加载该 ckpt 的解码器
+    decoder.ckpt = "/home/lxx/open_source/GraphGDP/work/vp_cg_Diffusion50/temporal_decoder_best.pth"
     decoder.pretrained = True  # 若 True 则加载预训练解码器
     decoder.epochs = 300  # 解码器训练轮数
-    decoder.n_hidden=64
+    decoder.n_hidden=128
     decoder.msg_hidden=128
 
     # ============== Training ==============
@@ -31,7 +32,6 @@ def get_config():
     training.snapshot_freq_for_preemption = 5000
     training.snapshot_sampling = True
     training.likelihood_weighting = False
-
     # 本文件特有：解码器与引导采样配置（保留）
     training.test_guided_sampling = True
 
@@ -51,12 +51,12 @@ def get_config():
     sampling.snr = 0.16
     sampling.vis_row = 4
     sampling.vis_col = 4
-    sampling.guidance_weight = 2.0  # 引导采样权重
+    sampling.guidance_weight = 0.5  # 引导采样权重
 
     # ============== Evaluation ==============
     config.eval = evaluate = ml_collections.ConfigDict()
     evaluate.begin_ckpt = 5
-    evaluate.end_ckpt = 20
+    evaluate.end_ckpt = 100
     evaluate.batch_size = 1000
     evaluate.enable_sampling = True
     evaluate.num_samples = 1000
@@ -70,11 +70,11 @@ def get_config():
     data.centered = False
     data.dequantization = False
     data.root = "/home/lxx/open_source/GraphGDP/data"
-    data.name = "_springs"
+    data.name = "_Diffusion"
     data.temporal = True
-    data.ts_features = 4
-    data.max_node = 50
-    data.delta_t = 100
+    data.ts_features = 1
+    data.max_node = 10
+    data.delta_t = None
     data.num_channels = 1
 
     # ============== Model ==============
@@ -96,7 +96,7 @@ def get_config():
     model.beta_max = 5.0
     model.dropout = 0.0
     model.ts_cond = True
-    model.ts_in = 4
+    model.ts_in = 1
 
     # ============== Optim ==============
     config.optim = optim = ml_collections.ConfigDict()

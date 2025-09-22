@@ -11,10 +11,11 @@ def get_config():
 
     # ==============Decoder=============
     config.decoder = decoder = ml_collections.ConfigDict()
-    decoder.ckpt = None  # 若指定则加载该 ckpt 的解码器
+    # decoder.ckpt = None  # 若指定则加载该 ckpt 的解码器
+    decoder.ckpt = "/home/lxx/open_source/GraphGDP/work/vp_cg_springs10_100/temporal_decoder_best.pth"
     decoder.pretrained = True  # 若 True 则加载预训练解码器
-    decoder.epochs = 300  # 解码器训练轮数
-    decoder.n_hidden=64
+    decoder.epochs = 100  # 解码器训练轮数
+    decoder.n_hidden=128
     decoder.msg_hidden=128
 
     # ============== Training ==============
@@ -31,9 +32,16 @@ def get_config():
     training.snapshot_freq_for_preemption = 5000
     training.snapshot_sampling = True
     training.likelihood_weighting = False
-
     # 本文件特有：解码器与引导采样配置（保留）
     training.test_guided_sampling = True
+
+    # 新增：后验引导训练期配置（默认关闭，避免影响现有基线）
+    training.posterior_guidance = pg = ml_collections.ConfigDict()
+    pg.joint_weight = 0.0          # 联合正则 -λ log pψ(X|A0_hat)（默认关）
+    pg.align_weight = 2.0          # 稳定对齐权重（建议 0.05–0.2 起步；0 为关闭）
+    pg.t_cut_ratio = 0.02          # 小 t 采样区间上限占比
+    pg.align_normalize = True      # 单位化两个向量场，稳健默认
+    pg.align_warmup_steps = 100   # 对齐损失 warmup 步数
 
     # ============== Sampling ==============
     config.sampling = sampling = ml_collections.ConfigDict()
@@ -51,12 +59,13 @@ def get_config():
     sampling.snr = 0.16
     sampling.vis_row = 4
     sampling.vis_col = 4
-    sampling.guidance_weight = 2.0  # 引导采样权重
+    sampling.guidance_weight = 200.0  # decoder guidance weight
+    sampling.eps=1e-3 # vpsde sampling eps
 
     # ============== Evaluation ==============
     config.eval = evaluate = ml_collections.ConfigDict()
     evaluate.begin_ckpt = 5
-    evaluate.end_ckpt = 20
+    evaluate.end_ckpt = 100
     evaluate.batch_size = 1000
     evaluate.enable_sampling = True
     evaluate.num_samples = 1000
@@ -73,7 +82,7 @@ def get_config():
     data.name = "_springs"
     data.temporal = True
     data.ts_features = 4
-    data.max_node = 50
+    data.max_node = 10
     data.delta_t = 100
     data.num_channels = 1
 
@@ -91,7 +100,7 @@ def get_config():
     model.edge_th = -1.0
     model.heads = 8
     model.attn_clamp = False
-    model.num_scales = 1000 # VPSDE sampling steps
+    model.num_scales = 100 # VPSDE sampling steps
     model.beta_min = 0.1
     model.beta_max = 5.0
     model.dropout = 0.0
