@@ -61,34 +61,45 @@ def get_sde_loss_fn(sde, train, reduce_mean=True, continuous=True, likelihood_we
     def loss_fn(model, batch):
         """Compute the loss function.
 
-        Args:
-            model: A score model.
-            batch: A mini-batch of training data, including adjacency matrices and mask.
-
-        Returns:
-            loss: A scalar that represents the average loss value across the mini-batch.
+        训练目标简介（连续时间 Score Matching）：
+          令 x_t = mean_t(x_0) + std_t · z，z~N(0,I)
+          - 非 LW（Score SDE）：min E || σ_t sθ(x_t,t) + z ||^2
+          - LW（Likelihood weighting）：min E [ g(t)^2 || sθ(x_t,t) + z/σ_t ||^2 ]
+            其中 g(t) 为 SDE 的扩散系数（如 VPSDE 的 β(t) 的函数）
+        实现细节：
+          - 保持邻接矩阵对称：仅采样并使用下三角（含镜像）
+          - 使用 mask 仅在有效边上聚合损失
         """
         # adj, mask, _ = batch
         adj, mask, _ = batch['adj'], batch['mask'], batch['ts']
         score_fn = mutils.get_score_fn(sde, model, train=train, continuous=continuous)
+
+        # 随机采样时间 t ∈ (eps, T)
         t = torch.rand(adj.shape[0], device=adj.device) * (sde.T - eps) + eps
 
+        # 采样对称噪声 z（仅下三角，再镜像），保证扰动后仍为无自环对称矩阵
         z = torch.randn_like(adj)  # [B, C, N, N]
         z = torch.tril(z, -1)
         z = z + z.transpose(2, 3)
 
+        # 前向边缘分布参数（通常 VPSDE/VESDE 下 x_t|x_0 高斯）
         mean, std = sde.marginal_prob(adj, t)
         mean = torch.tril(mean, -1)
         mean = mean + mean.transpose(2, 3)
 
+        # 构造扰动数据：x_t = mean + std · z
         perturbed_data = mean + std[:, None, None, None] * z
+
+        # 目标：学习 sθ(x_t,t)
         score = score_fn(perturbed_data, t, mask=mask)
 
+        # 有效边掩码（对称），在向量化后用于按元素加权
         mask = torch.tril(mask, -1)
         mask = mask + mask.transpose(2, 3)
         mask = mask.reshape(mask.shape[0], -1)  # low triangular part of adj matrices
 
         if not likelihood_weighting:
+            # 非 LW：min E || σ_t sθ + z ||^2
             losses = torch.square(score * std[:, None, None, None] + z)
             losses = losses.reshape(losses.shape[0], -1)
             if reduce_mean:
@@ -97,6 +108,7 @@ def get_sde_loss_fn(sde, train, reduce_mean=True, continuous=True, likelihood_we
                 losses = 0.5 * torch.sum(losses * mask, dim=-1)
             loss = losses.mean()
         else:
+            # LW：min E [ g(t)^2 || sθ + z/σ_t ||^2 ]，见公式 (Hyvärinen 等/Score SDE 附录)
             g2 = sde.sde(torch.zeros_like(adj), t)[1] ** 2
             losses = torch.square(score + z / std[:, None, None, None])
             losses = losses.reshape(losses.shape[0], -1)
