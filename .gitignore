@@ -8,3 +8,5 @@ __pycache__/
 *.pyc
 *.pyo
 work/
+*.npy
+.vscode/settings.json
