@@ -5,8 +5,8 @@ import os
 import torch
 import numpy as np
 import random
-import torch.nn as nn  # 新增
-from typing import Optional  # 新增
+import torch.nn as nn  # 保留（尽管去掉对齐损失后当前文件可能无需 nn; 为避免意外影响其它潜在扩展暂不删除）
+from typing import Optional
 import logging
 import time
 from absl import flags
@@ -54,122 +54,7 @@ def _project_adjacency(A: torch.Tensor, mask: Optional[torch.Tensor] = None):
     return A.unsqueeze(1)
 
 
-def _tweedie_denoise(sde, A_t, t, score, eps=1e-8):
-    # A_t, score: [B,1,N,N]; t: [B] 或标量
-    mean, std = sde.marginal_prob(A_t, t)
-    B = A_t.size(0)
-    if mean.shape != A_t.shape:
-        mean = mean.expand_as(A_t)
-    if std.shape != A_t.shape:
-        std = std.view(B, 1, 1, 1).expand_as(A_t)
-    return (A_t + (std**2) * score) / (mean + eps)
-
-
-def _compute_alignment_loss(
-    decoder: nn.Module,
-    sde,
-    model: nn.Module,
-    batch: dict,
-    *,
-    align_weight: float = 0.0,
-    t_cut_ratio: float = 0.05,
-    normalize: bool = True,
-    eps: float = 1e-8,
-    continuous: bool = True,
-) -> torch.Tensor:
-    """
-    稳定版“对齐损失”：在小噪声区间让 score 对齐 decoder 的似然梯度。
-
-    设计动机
-    -------
-    - 在 t→0 的区域，score 与 ∇A_t log p(X|A_t) 存在近似关系。
-    - 用 Tweedie 去噪 + 解码器似然梯度估计，构造与 score 同量纲的目标向量场。
-    - 仅作数值引导，避免穿过 decoder 回传，稳定且与推理时的引导语义一致。
-
-    参数
-    ----
-    decoder : nn.Module
-        预训练解码器，仅用于前向与梯度估计。
-    sde, model : Any
-        SDE 与 score 模型。
-    batch : dict
-        至少包含 'adj'、'mask'、'ts'，形状与现有训练一致。
-    align_weight : float
-        对齐损失权重；0 关闭。
-    t_cut_ratio : float
-        小 t 采样区间上限占比，默认 5%。
-    normalize : bool
-        是否单位化两个向量场，缓解尺度不匹配。
-    continuous, eps : 见上文。
-
-    返回
-    ----
-    torch.Tensor
-        标量损失（已乘以 align_weight）。
-    """
-    if decoder is None or align_weight <= 0.0:
-        return torch.tensor(0.0, device=batch["adj"].device)
-
-    A0 = batch["adj"]  # [B,1,N,N]
-    mask = batch.get("mask", torch.ones_like(A0))
-    if mask.dim() == 3:
-        mask = mask.unsqueeze(1)  # 保证为 [B,1,N,N]
-    ts = batch.get("ts", None)
-    B = A0.size(0)
-    device = A0.device
-
-    # 1) 小 t 区间随机采样
-    t_cut = max(1e-5, float(t_cut_ratio) * float(sde.T))
-    t = torch.rand(B, device=device) * (t_cut - 1e-5) + 1e-5  # [B]
-    z = torch.randn_like(A0)
-    mean, std = sde.marginal_prob(A0, t)  # [B] or [B,1,1,1]
-    if mean.shape != A0.shape:
-        mean = mean.expand_as(A0)
-    if std.shape != A0.shape:
-        std = std.view(B, 1, 1, 1).expand_as(A0)
-    # 2) 构造 A_t 并计算 score
-    A_t = mean + std * z
-    A_t.requires_grad_(True)
-    score_fn = mutils.get_score_fn(sde, model, train=True, continuous=continuous)
-    score = score_fn(A_t, t, mask=mask)  # [B,1,N,N]
-
-    # 3) Tweedie 去噪得到 A0_hat（复用工具函数，减少重复）
-    A0_hat = _tweedie_denoise(sde, A_t, t, score, eps=eps)  # [B,1,N,N]
-
-    # 4) 用解码器估计似然梯度（对对称零对角投影后的 A）
-    A0_in = A0_hat.squeeze(1)  # [B,N,N]
-    try:
-        g_dec = decoder.compute_likelihood_gradient_backup(A0_in, ts)  # [B,N,N]
-    except Exception as e:
-        logging.warning("alignment gradient failed: %s", str(e))
-        g_dec = torch.zeros_like(A0_in)
-    # 5) 结构与掩码一致性
-    g_dec = 0.5 * (g_dec + g_dec.transpose(-1, -2))
-    g_dec = g_dec - torch.diag_embed(torch.diagonal(g_dec, dim1=-2, dim2=-1))
-    g_dec = g_dec * mask.squeeze(1)
-
-    # 6) 拉回 A_t 空间：∇_{At} ≈ (1/mean) ∇_{A0}
-    g_up = g_dec.unsqueeze(1) / (mean + eps)  # [B,1,N,N]
-
-    # 7) 可选单位化，避免尺度不匹配
-    if normalize:
-
-        def _unit(x: torch.Tensor, m: torch.Tensor) -> torch.Tensor:
-            flat = (x * m).reshape(x.size(0), -1)
-            n = flat.norm(dim=1, keepdim=True) + eps
-            return x / n.view(-1, 1, 1, 1)
-
-        score_used = _unit(score, mask)
-        g_used = _unit(g_up, mask)
-    else:
-        score_used, g_used = score, g_up
-
-    # 8) MSE 对齐（仅在有效边域内）
-    diff = (score_used - g_used) * mask
-    assert mask.shape == g_up.shape, f"mask shape {mask.shape}, g_up shape {g_up.shape}"
-    assert diff.shape == mask.shape, f"diff shape {diff.shape}, mask shape {mask.shape}"
-    mse = (diff.pow(2).sum(dim=(1, 2, 3)) / (mask.sum(dim=(1, 2, 3)) + eps)).mean()
-    return align_weight * mse
+## Removed alignment loss utilities (_tweedie_denoise & _compute_alignment_loss) per user request.
 
 
 def _build_decoder(config, device, workdir, train_ds, eval_ds, mode: str):
@@ -401,13 +286,7 @@ def sde_train_with_decoder(config, workdir):
         continuous=continuous,
         likelihood_weighting=likelihood_weighting,
     )
-    # 读取对齐与联合正则的配置（一次性解析，减少循环内开销）
-    pg_cfg = getattr(getattr(config, "training", object()), "posterior_guidance", None)
-    align_w = float(getattr(pg_cfg, "align_weight", 0.0)) if pg_cfg else 0.0
-    t_cut_ratio = float(getattr(pg_cfg, "t_cut_ratio", 0.05)) if pg_cfg else 0.05
-    align_norm = bool(getattr(pg_cfg, "align_normalize", True)) if pg_cfg else True
-    warmup_steps = int(getattr(pg_cfg, "align_warmup_steps", 1000)) if pg_cfg else 1000
-    joint_w = float(getattr(pg_cfg, "joint_weight", 0.0)) if pg_cfg else 0.0
+    # Removed posterior guidance / alignment configuration (align_* & joint_w) since alignment loss is deprecated.
 
     max_steps = config.training.n_iters
     log_freq = config.training.log_freq
@@ -438,24 +317,8 @@ def sde_train_with_decoder(config, workdir):
         optimizer.zero_grad(set_to_none=True)
         base_loss = loss_fn(score_model, batch)
 
-        # 新增：稳定版对齐损失（小 t 对齐似然梯度）
-        if align_w > 0.0:
-            warm = min(1.0, (step + 1) / max(1, warmup_steps))
-            align_loss = _compute_alignment_loss(
-                decoder=decoder,
-                sde=sde,
-                model=score_model,
-                batch=batch,
-                align_weight=align_w * warm,
-                t_cut_ratio=t_cut_ratio,
-                normalize=align_norm,
-                continuous=True,
-            )
-        else:
-            align_loss = torch.tensor(0.0, device=device)
-
-        total_loss = base_loss + align_loss
-        total_loss.backward()
+        # Alignment loss removed; only base loss is used for optimization.
+        base_loss.backward()
         if config.optim.grad_clip > 0:
             torch.nn.utils.clip_grad_norm_(score_model.parameters(), config.optim.grad_clip)
         optimizer.step()
@@ -464,14 +327,10 @@ def sde_train_with_decoder(config, workdir):
         # logging
         if step % log_freq == 0:
             writer.add_scalar("train/loss_base", base_loss.item(), step)
-            writer.add_scalar("train/loss_align", align_loss.item(), step)
-            writer.add_scalar("train/loss_total", total_loss.item(), step)
             logging.info(
-                "step: %d, loss_base: %.5e, loss_align: %.5e, loss_total: %.5e",
+                "step: %d, loss_base: %.5e",
                 step,
                 base_loss.item(),
-                align_loss.item(),
-                total_loss.item(),
             )
 
         # 抢占式快照（与 sde_train 对齐）
