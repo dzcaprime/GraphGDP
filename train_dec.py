@@ -106,7 +106,7 @@ def _train_one_epoch(
         A_t, t = _add_sde_noise(A, sde, device, mask)
 
         # 期望 decoder(A_t, X, return_loglik=True) 返回 (pred, loglik)
-        pred, loglik = decoder(A_t, X, return_loglik=True, burn_in=False, burn_in_steps=5)
+        pred, loglik = decoder(A_t, X, return_loglik=True, burn_in=True, burn_in_steps=5)
         if loglik is None:
             continue
 
@@ -147,7 +147,7 @@ def _eval_one_epoch(decoder: RNNDecoder, loader: DataLoader, device: torch.devic
         # 对邻接加噪声
         A_t, t = _add_sde_noise(A, sde, device, mask)
 
-        pred, loglik = decoder(A_t, X, return_loglik=True, burn_in=False, burn_in_steps=5)
+        pred, loglik = decoder(A_t, X, return_loglik=True, burn_in=True, burn_in_steps=5)
         if loglik is None:
             continue
 
