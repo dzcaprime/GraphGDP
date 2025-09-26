@@ -6,7 +6,7 @@
 
 # CUDA_VISIBLE_DEVICES=1 python main.py --config configs/vp_cg_springs.py --mode train --workdir work/vp_cg_springs50_100
 
-CUDA_VISIBLE_DEVICES=3 python main.py --config configs/vp_cg_springs10_100.py --mode train --workdir work/vp_cg_springs10_100
+CUDA_VISIBLE_DEVICES=3 python main.py --config configs/vp_cg_springs10_100.py --mode eval --workdir work/vp_cg_springs10_100
 
 # CUDA_VISIBLE_DEVICES=5 python main.py --config configs/vp_cg_Kuramoto10_100.py --mode train --workdir work/vp_cg_Kuramoto10_100
 
