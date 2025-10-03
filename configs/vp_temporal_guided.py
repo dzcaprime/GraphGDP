@@ -48,12 +48,12 @@ def get_config():
     sampling.snr = 0.16
     sampling.vis_row = 4
     sampling.vis_col = 4
-    sampling.guidance_weight = 0.0  # 引导采样权重
+    sampling.guidance_weight = 5.0  # 引导采样权重
 
     # ============== Evaluation ==============
     config.eval = evaluate = ml_collections.ConfigDict()
     evaluate.begin_ckpt = 5
-    evaluate.end_ckpt = 20
+    evaluate.end_ckpt = 70
     evaluate.batch_size = 1000
     evaluate.enable_sampling = True
     evaluate.num_samples = 1000
